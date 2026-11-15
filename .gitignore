@@ -1,7 +1,5 @@
 # 虚拟环境
 venv/
-.venv/
-env/
 
 # Python 缓存
 __pycache__/
@@ -11,9 +9,16 @@ __pycache__/
 
 # 本地数据库和日志
 chroma_db/
+# 打开失败时自动隔离的旧向量库（见 README「常见问题」）
+chroma_db.broken_*/
 logs/
 *.log
-# 与本地向量数据库配套的导入去重记录，必须一起排除
+# 本地账号库，含密码哈希，只在本机使用
+data/app.db
+data/app.db-journal
+data/app.db-wal
+data/app.db-shm
+# 历史遗留：旧版本的知识库导入去重记录，新版本已改为存入向量库元数据
 /md5.txt
 
 # 本地密钥配置；.env.example 只能包含变量名和占位符

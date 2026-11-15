@@ -22,7 +22,9 @@ class ChatModelFactory(BaseModelFactory):
         return ChatOpenAI(
             model=rag_conf["CHAT_MODEL_NAME"],
             api_key=os.environ["DASHSCOPE_API_KEY"],
-            base_url=rag_conf["BASE_URL"]
+            base_url=rag_conf["BASE_URL"],
+            timeout=30,
+            max_retries=2,
         )
 
 

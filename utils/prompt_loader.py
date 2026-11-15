@@ -22,22 +22,6 @@ def load_system_prompts():
         raise e
 
 
-# 加载RAG总结提示词
-def load_rag_prompts():
-    try:
-        rag_summarize_prompt_path = get_abs_path(prompts_conf['rag_summarize_prompt_path'])
-    except KeyError as e:
-        logger.error("prompts.yml配置文件中没有rag_summarize_prompt_path配置项")
-        raise e
-    try:
-        with open(rag_summarize_prompt_path, 'r', encoding='utf-8') as f:
-            return f.read()
-
-    except Exception as e:
-        logger.error(f"解析RAG prompt出错,{str(e)}")
-        raise e
-
-
 # 加载报告提示词
 def load_report_prompts():
     try:
