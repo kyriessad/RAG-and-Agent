@@ -11,6 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from agent.tools.chat_session import forget_session, stream_chat
 from utils import user_store
 from utils.followup_store import get_followup_task, list_followup_tasks
+from utils.draft_store import SaveDraftData, get_task_draft, save_task_draft
 from utils.logger_handler import logger
 
 app = FastAPI(title="高血压随访助手")
@@ -106,6 +107,33 @@ def task_detail(task_id: str, user: dict = Depends(current_user)):
     return task
 
 
+@app.get("/tasks/{task_id}/draft")
+def task_draft(task_id: str, user: dict = Depends(current_user)):
+    """读取当前患者的采集草稿；无草稿返回版本 0，越权返回 404，不调用模型。"""
+    try:
+        return get_task_draft(user["user_id"], user["role"], task_id)
+    except PermissionError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+
+
+@app.put("/tasks/{task_id}/draft")
+def update_task_draft(task_id: str, data: SaveDraftData, user: dict = Depends(current_user)):
+    """输入完整表单和读取时版本，保存草稿并返回新版本；不正式提交随访。
+
+    例如 {expected_revision: 0, data: {symptoms: "没有不舒服"}}。
+    字段错误返回 422，过期版本或任务不可编辑返回 409，越权返回 404。
+    """
+    try:
+        return save_task_draft(user["user_id"], user["role"], task_id,
+                               data.expected_revision, data.data.model_dump())
+    except PermissionError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except RuntimeError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+
+
 @app.post("/chat")
 def chat(data: ChatData, user: dict = Depends(current_user)):
     """输入消息和可选任务编号，返回聊天事件流；任务无权访问时先返回 404。
@@ -121,7 +149,7 @@ def chat(data: ChatData, user: dict = Depends(current_user)):
             raise HTTPException(status_code=404, detail="任务不存在或无权访问。")
 
     def events():
-        """不接收额外输入，把已鉴权的聊天事件转换成逐行 JSON；不写业务库。"""
+        """把事件转为逐行 JSON；草稿校验保存由会话层调用 utils 完成。"""
         # 一行一个 JSON 事件，前端收到一行便可更新工具状态或回答。
         for event in stream_chat(
             user["session_key"], user["user_id"], user["role"], data.message,

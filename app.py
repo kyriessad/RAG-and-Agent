@@ -54,8 +54,174 @@ import streamlit as st
 from utils.api_client import request_api
 
 
+# 这些名称只用于页面；传给后端时仍使用左边的固定字段名。
+DRAFT_TEXT_FIELDS = {
+    "systolic_bp": "高压（收缩压，mmHg）",
+    "diastolic_bp": "低压（舒张压，mmHg）",
+    "measured_at": "什么时候测的？（可保留原话）",
+    "symptoms": "最近有没有哪里不舒服？",
+    "missed_dose_reason": "如果漏服了，是什么原因？",
+    "adverse_effects": "吃药后有没有不舒服？",
+}
+DRAFT_CHOICES = {
+    "bp_measurement_status": {"未说明": None, "测过了": "measured", "还没测": "not_measured"},
+    "medication_adherence": {
+        "未说明": None, "按时服药": "regular", "有漏服": "missed", "没有开药": "not_prescribed",
+    },
+}
+
+
+def clear_draft_state():
+    """清除草稿页面状态，返回 None；只清内存，不删除后端已保存草稿。"""
+    # list() 先复制键名，避免一边遍历字典一边删除导致错误。
+    for key in list(st.session_state):
+        if key.startswith("draft_"):
+            st.session_state.pop(key, None)  # 退出或切换任务时连输入框一起清理。
+
+
+def draft_display_values(data):
+    """输入草稿字段字典，返回输入框显示值；例如 systolic_bp=None 变成空字符串。
+
+    只转换显示格式，不请求网络、不补全缺失值、不改变业务数据。
+    """
+    values = {}  # 普通字典，例如 {"systolic_bp": "138", "symptoms": ""}。
+    for field in DRAFT_TEXT_FIELDS:
+        value = data.get(field)  # None 表示没有提供，不当成 0 或“没有症状”。
+        values[field] = ""
+        if value is not None:
+            values[field] = str(value)
+    for field, choices in DRAFT_CHOICES.items():
+        values[field] = "未说明"  # 空值的唯一默认选项。
+        for label, value in choices.items():
+            if value == data.get(field):
+                values[field] = label  # 例如 regular 对应“按时服药”。
+    return values
+
+
+def draft_has_changes():
+    """比较页面输入和加载时的草稿，返回 bool；只读页面内存，不访问后端。"""
+    base = st.session_state.get("draft_base")  # base 是带 revision 的完整接口返回值。
+    if base is None:
+        return False  # 尚未进入草稿页面，没有可以丢失的修改。
+    values = draft_display_values(base["data"])
+    edits = st.session_state.get("draft_edits", {})  # 请求失败后控件可能消失，备份仍在。
+    for field, value in values.items():
+        current = st.session_state.get("draft_field_" + field, edits.get(field, value))
+        if current != value:
+            return True  # 包括患者主动清空已有内容的情况。
+    return False
+
+
+def remember_draft_edits():
+    """在请求前备份草稿输入，返回 None；只写页面内存，不保存到数据库。
+
+    请求失败可能让本轮页面提前停止，Streamlit 会清理未渲染控件的键。
+    把输入另存普通字典，恢复连接后仍能找回尚未点击保存的文字。
+    """
+    base = st.session_state.get("draft_base")
+    if base is None:
+        return  # 尚未加载过草稿，不创建替代数据。
+    edits = st.session_state.get("draft_edits", {})
+    for field in draft_display_values(base["data"]):
+        key = "draft_field_" + field
+        if key in st.session_state:
+            edits[field] = st.session_state[key]  # 保留本次浏览器送来的最新输入，包括主动清空。
+    st.session_state["draft_edits"] = edits  # 普通字典不会随控件消失被 Streamlit 清理。
+
+
+def load_draft_fields(draft):
+    """把接口草稿放进页面内存，返回 None；仅在本轮输入框创建前调用。
+
+    输入包含 task_id/revision/data；此函数不写数据库，明确重新加载时会替换本地修改。
+    """
+    st.session_state["draft_base"] = draft  # 保存版本，之后 PUT 用它防止旧页面覆盖新数据。
+    values = draft_display_values(draft["data"])
+    st.session_state["draft_edits"] = dict(values)  # 明确重新加载时同步替换备份，不能恢复被放弃的旧值。
+    for field, value in values.items():
+        st.session_state["draft_field_" + field] = value  # 控件 key 保持稳定，普通重跑不重置输入。
+
+
+def show_patient_draft(token, task_id):
+    """读取、展示并修改当前患者草稿，返回 None；通过 GET/PUT 读写 task_drafts。
+
+    输入是登录凭证与任务编号。保存发送 expected_revision 和完整 data 字典。
+    无权访问或连接失败时停止当前页面；冲突保留本地输入，不自动重试覆盖。
+    """
+    path = f"/tasks/{task_id}/draft"  # 例如 /tasks/F001/draft，任务归属仍由后端校验。
+    try:
+        latest = request_api("GET", path, token=token).json()  # 重进页面可恢复数据库里的草稿。
+    except requests.RequestException as error:
+        if error.response is not None and error.response.status_code in (403, 404):
+            clear_task_selection()  # 权限失效后不能继续展示旧草稿。
+        show_request_error(error)
+        if st.button("重新加载草稿", key="draft_retry"):
+            st.rerun()
+        st.stop()  # 请求失败不等于空草稿，也不开放可能覆盖旧数据的编辑。
+
+    base = st.session_state.get("draft_base")
+    if base is None or base["task_id"] != task_id or st.session_state.pop("draft_reload", False):
+        load_draft_fields(latest)  # 首次进入或明确保存成功后，采用服务器返回值。
+    elif latest["revision"] != base["revision"] and not draft_has_changes():
+        load_draft_fields(latest)  # 没有手工改动时，安全展示 Agent 或另一个页面保存的新版本。
+    base = st.session_state["draft_base"]
+    for field, value in st.session_state.get("draft_edits", {}).items():
+        key = "draft_field_" + field
+        if key not in st.session_state:
+            st.session_state[key] = value  # 仅恢复请求失败期间被清掉的控件，不覆盖本轮新输入。
+    st.subheader("我的随访信息草稿")
+    st.caption("空白表示还没说明，可以先保存部分信息。保存草稿不等于正式提交。")
+    if st.session_state.pop("draft_saved_notice", False):
+        st.success("草稿已保存，可继续补充或修改。")
+    if latest["revision"] != base["revision"]:
+        st.warning("草稿已有更新，当前输入仍保留。请先核对，再放弃当前修改并重新加载，避免覆盖新内容。")
+    if draft_has_changes():
+        st.caption("当前有尚未保存的修改。请先保存，再聊天、返回任务列表或退出。")
+    if st.button("放弃当前修改并重新加载", key="draft_discard"):
+        load_draft_fields(latest)  # 用户已明确选择放弃，才替换输入及版本。
+        st.rerun()
+    if latest["missing_fields"]:
+        st.write("已保存草稿还需补充：" + "、".join(latest["missing_fields"]))
+    editable = latest["editable"]  # 即使控件不可编辑，后端保存接口仍要独立校验状态。
+    if not editable:
+        st.info("这项任务当前不能修改草稿，下面仅供查看。")
+    st.selectbox("这次测过血压了吗？", list(DRAFT_CHOICES["bp_measurement_status"]),
+                 key="draft_field_bp_measurement_status", disabled=not editable)
+    for field, label in DRAFT_TEXT_FIELDS.items():
+        st.text_input(label, key="draft_field_" + field, disabled=not editable)
+    st.selectbox("最近服药情况", list(DRAFT_CHOICES["medication_adherence"]),
+                 key="draft_field_medication_adherence", disabled=not editable)
+    if st.button("保存草稿", key="draft_save", disabled=not editable):
+        data = {}  # 空输入转换为 None；接口 JSON 中对应 null。
+        try:
+            for field in DRAFT_TEXT_FIELDS:
+                value = st.session_state["draft_field_" + field].strip()
+                data[field] = None
+                if value:
+                    data[field] = value  # 时间、症状和原因保留文字，不自行推算日期或医学结论。
+                    if field in ("systolic_bp", "diastolic_bp"):
+                        data[field] = int(value)  # 无法转成整数时明确报错，不写成 0。
+            for field, choices in DRAFT_CHOICES.items():
+                data[field] = choices[st.session_state["draft_field_" + field]]
+        except ValueError:
+            st.error("高压和低压请填整数；还不知道时留空即可。")
+            return  # 输入仍保留在控件中，患者可以修改。
+        try:
+            request_api("PUT", path, token=token, data={
+                "expected_revision": base["revision"], "data": data,
+            })  # 例如 revision=2；如果服务器已是 3，必须拒绝覆盖。
+        except requests.RequestException as error:
+            show_request_error(error)
+            if error.response is not None and error.response.status_code == 409:
+                st.warning("未覆盖服务器草稿。当前输入仍保留，请核对后重新加载。")
+        else:
+            st.session_state["draft_reload"] = True  # 下一轮控件创建前再更新，避免修改已创建的控件。
+            st.session_state["draft_saved_notice"] = True
+            st.rerun()
+
+
 def clear_login():
     """清除页面登录信息。无输入、返回 None；不删除数据库账号或医疗记录。"""
+    clear_draft_state()  # 清除草稿及输入框缓存，防止下一个账号看到旧内容。
     # user={...} 保存账号字典；token="示例令牌" 保存登录凭证字符串；message=[...] 保存聊天消息列表。
     # agent 是旧版页面留下的键。当前版本的 Agent 对象在后端，本页面不再创建它。
     # 退出或登录过期时，一起清掉身份、令牌和页面里的聊天历史。
@@ -99,7 +265,7 @@ def show_request_error(error):
         # isinstance(x, str) 检查 x 是否为字符串。
         # FastAPI 的 422 校验错误可能返回 detail=[{...}, ...]，即 list，
         # 不直接把内部校验结构堆给用户看，而是换成容易理解的提示。
-        detail = "输入格式不正确，请检查用户名、密码或消息长度。"
+        detail = "输入格式不正确，请检查填写的内容、数值和长度。"
     st.error(detail)
 
     # 登录过期后只清理本地状态，下一次脚本重跑便会回到登录页。
@@ -111,6 +277,7 @@ def show_request_error(error):
 
 def clear_task_selection():
     """返回任务列表前清理当前选择。无输入、返回 None；只修改页面会话内存。"""
+    clear_draft_state()  # 切换任务不沿用上一项任务的草稿和版本。
     # selected_task 是任务字典，例如 {"task_id": "F001", "task_status": "pending", ...}。
     st.session_state.pop("selected_task", None)
     # 切换任务不沿用屏幕上的旧对话，避免把前一项任务的问题显示到新任务下。
@@ -200,7 +367,13 @@ def show_patient_tasks(token):
                 clear_task_selection()
         show_request_error(error)
         # 连接失败时也不显示未经本轮校验的任务信息；用户可以返回后重试。
-        if st.button("返回任务列表", key="return_tasks"):
+        return_label = "返回任务列表"
+        if draft_has_changes():
+            st.warning("尚未保存的修改已暂存在页面中，恢复连接后可继续编辑。")
+            return_label = "放弃修改并返回任务列表"  # 请求失败时若要离开，也应明确告知会放弃修改。
+        if st.button("重新加载当前任务", key="reload_current_task"):
+            st.rerun()
+        if st.button(return_label, key="return_tasks"):
             clear_task_selection()
             st.rerun()
         st.stop()
@@ -209,16 +382,21 @@ def show_patient_tasks(token):
     st.session_state["selected_task"] = task_detail
     st.subheader(f"当前随访任务：{task_detail['task_id']}")
     show_task_details(task_detail)
-    # 当前只完成任务入口和查询对话，不让患者误以为聊天就等于正式提交。
-    st.info("当前可围绕这项任务查询和交流，暂不能正式提交随访信息。")
+    # 第二步只保存业务草稿，不把聊天或保存按钮说成正式提交。
+    st.info("可以和助手聊聊本次情况，再检查、修改并保存草稿；暂不能正式提交随访信息。")
     if st.button("返回任务列表", key="return_tasks"):
-        clear_task_selection()
-        st.rerun()
+        if draft_has_changes():
+            st.warning("还有未保存的修改，请先保存草稿，或明确放弃当前修改后再返回。")
+        else:
+            clear_task_selection()
+            st.rerun()
     # 返回字典供下面组装聊天请求，task_id 只表示选择，后端仍会独立鉴权。
     return task_detail
 
 
 # ==================== 页面上方固定内容 ====================
+# 先接住浏览器刚提交的输入，再请求身份、任务和草稿，避免网络失败让未保存内容消失。
+remember_draft_edits()
 # 这几句每次脚本重跑都会执行。set_page_config 设置浏览器标签标题和图标，
 st.set_page_config(page_title="高血压随访助手", page_icon="💬")
 st.title("高血压随访助手")
@@ -384,17 +562,17 @@ with st.sidebar:
     # f 字符串会把花括号中的变量值填进去，例如最终为 "patient_sun · 患者"。
     st.write(f"{user['username']} · {role_name}")
     if st.button("退出登录"):
-        try:
-            # 先通知后端：删除 medical.db.sessions 中该凭证的记录，并清掉后端 Agent。
-            # 这不会删除 medical.db.users 账号或患者的医疗记录。
-            request_api("POST", "/auth/logout", token=token)
-        except requests.RequestException as error:
-            show_request_error(error)
-            # 后端退出没有成功时先显示错误，不假装已经完成了凭证撤销。
-            st.stop()
-        # 后端退出成功后，再删除 Streamlit 会话中的 user/token/message。
-        clear_login()
-        st.rerun()
+        if draft_has_changes():
+            st.warning("还有未保存的修改，请先保存草稿，或明确放弃当前修改后再退出。")
+        else:
+            try:
+                # 通知后端删除登录凭证，再清理页面；不会删除已经保存的草稿。
+                request_api("POST", "/auth/logout", token=token)
+            except requests.RequestException as error:
+                show_request_error(error)
+                st.stop()  # 退出失败时不假装已经撤销了凭证。
+            clear_login()
+            st.rerun()
 
     # 这段灰色文字是写在代码里的固定提示，不是从数据库查出来的任务列表。
     st.caption("可以问：我的随访什么时候到期？出院时有哪些注意事项？最近血压记录是什么？")
@@ -403,6 +581,7 @@ with st.sidebar:
 current_task = None
 if user["role"] == "patient":
     current_task = show_patient_tasks(token)
+    show_patient_draft(token, current_task["task_id"])  # 只通过 HTTP 读写草稿，前端不连接数据库。
 
 # ==================== 用历史数据重新画出聊天消息 ====================
 # message = {"role":"assistant","content":"你好"}。
@@ -414,7 +593,7 @@ for message in st.session_state.get("message", []):
         st.markdown(message["content"])
 
 # ==================== 接收这一轮新问题 ====================
-prompt = st.chat_input("请输入你的问题", max_chars=4000)
+prompt = st.chat_input("请输入你的问题或本次随访情况", max_chars=4000, disabled=draft_has_changes())
 if prompt and prompt.strip():
     # chat_message(...).write(prompt) 是先创建用户消息容器，再在其中写入文字。
     st.chat_message("user").write(prompt)
@@ -433,6 +612,7 @@ if prompt and prompt.strip():
         completed = False
         # failed: bool，是否发生网络错误、格式错误或后端发来的 error 事件。
         failed = False
+        draft_updated = False  # 收到已保存的草稿事件后，结束回答再重新加载页面。
 
         try:
             # method="POST"，path="/chat"，token 是登录凭证，data 是问题字典。
@@ -463,7 +643,7 @@ if prompt and prompt.strip():
                     event_type = event["type"]
                     content = event["content"]
 
-                    # event_type 和 content 在当前协议里都是 str。
+                    # event_type 是 str；draft 事件的 content 是字典，其余事件正文是 str。
                     # 这几个字符串是前后端约定的事件名，不是 Streamlit 自动规定的。
                     # 一轮可能有多次工具调用，因此不保证每种事件都只出现一次。
                     # 工具状态与回答分别放置，例如“正在检索高血压知识库”。
@@ -488,6 +668,10 @@ if prompt and prompt.strip():
                         # 所以这里用 = 覆盖，不能 +=，否则前面流过的文字会重复一遍。
                         answer = content
                         completed = True
+                    elif event_type == "draft":
+                        # 事件只提示后端已保存；页面重跑后再从草稿接口取最新内容与版本。
+                        if current_task is not None and content["task_id"] == current_task["task_id"]:
+                            draft_updated = True
                     elif event_type == "error":
                         # HTTP 已经返回 200 开始传流后，模型仍可能失败。
                         # 因此即使 HTTP 状态正常，也必须检查流中的 error 事件。
@@ -512,6 +696,9 @@ if prompt and prompt.strip():
             answer_box.markdown(answer)
             # 这里只追加一条完整助手消息，不是每收到一个 delta 就追加一条。
             st.session_state["message"].append({"role": "assistant", "content": answer})
+            if draft_updated:
+                st.session_state["draft_saved_notice"] = True
+                st.rerun()  # 新一轮只重画历史，不重复发送这条消息。
         else:
             # 发生错误时删除屏幕上的半成品，但保留错误提示和用户已经发送的问题。
             answer_box.empty()

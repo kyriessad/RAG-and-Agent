@@ -8,6 +8,7 @@ from langgraph.runtime import Runtime
 from langgraph.types import Command
 from utils.logger_handler import logger
 from utils.prompt_loader import load_report_prompts, load_system_prompts
+from agent.tools.draft_collection import collection_prompt
 
 
 # 工具执行的监控，参数：request请求的数据封装,  handler执行的函数本身
@@ -28,7 +29,8 @@ def monitor_tool(
         logger.info(f"[tool monitor]工具{request.tool_call['name']}调用成功")
         return result
     except Exception as e:
-        logger.error(f"工具{request.tool_call['name']}调用失败，原因: {str(e)}")
+        # Pydantic 错误可能带 input_value；只记录类型，避免患者原话进入日志。
+        logger.error("工具%s调用失败，错误类型：%s", request.tool_call['name'], type(e).__name__)
         raise e
 
 
@@ -48,8 +50,10 @@ def log_before_model(
 # 每次在生成提示词之前调用此函数   prompt_template之前
 @dynamic_prompt                 # 每一次在生成提示词之前，调用此函数
 def report_prompt_switch(request: ModelRequest):  # 动态切换提示词
+    """输入框架模型请求，返回系统提示词及当前采集草稿；不请求网络或写库。"""
     is_report = request.runtime.context.get("report", False)
     if is_report:               # 是报告生成场景，返回报告生成提示词内容
         return load_report_prompts()
 
-    return load_system_prompts()
+    # 每次推理携带后端本轮读取的草稿；患者手工修改优先于旧聊天记忆。
+    return load_system_prompts() + collection_prompt(request.runtime.context)

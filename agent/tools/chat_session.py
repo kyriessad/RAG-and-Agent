@@ -3,6 +3,7 @@ from threading import Lock
 from time import monotonic
 
 from utils.logger_handler import logger
+from utils.draft_store import get_task_draft, save_task_draft
 
 
 # 字典的键是登录令牌的哈希，不保存原始令牌。
@@ -49,7 +50,8 @@ def stream_chat(session_key, user_id, role, message, task_id=None):
     例如 task_id="F001"、message="这个任务什么时候到期？"。
     输出：依次产生 {"type": "status", "content": "..."} 等事件。
     同一任务保留多轮记忆；身份或任务改变时重建 Agent，避免混入旧任务信息。
-    只更新后端内存；同会话并发请求和模型失败返回 error 事件，不写业务库。
+    患者任务每轮读取持久草稿；仅在模型完整结束后保存经校验的提议。
+    同会话并发、模型失败或版本冲突返回 error，不提交正式记录或改变任务状态。
     """
     # monotonic() 是只向前走的计时值，用于清理一天没有使用的内存会话。
     now = monotonic()
@@ -70,6 +72,10 @@ def stream_chat(session_key, user_id, role, message, task_id=None):
         return
 
     try:
+        # 草稿按任务保存，不依赖聊天记忆；换登录或重启后仍读取同一份业务数据。
+        draft = None
+        if role == "patient" and task_id is not None:
+            draft = get_task_draft(user_id, role, task_id)
         # 如果身份或任务范围发生变化，丢弃旧 Agent，重新建立独立的任务记忆。
         agent = session["agent"]
         if agent is not None:
@@ -84,14 +90,45 @@ def stream_chat(session_key, user_id, role, message, task_id=None):
             # 同时传入身份与任务范围，后续工具查询由这些服务端值限定。
             session["agent"] = create_chat_agent(user_id, role, task_id=task_id)
 
-        # 沿用 ReactAgent 的 status/reset/delta/answer 事件，保留流式输出。
-        yield from session["agent"].execute_stream(message)
+        # 普通查询沿用原签名；患者任务把最新草稿传入每一轮推理。
+        if draft is None:
+            events = session["agent"].execute_stream(message)
+        else:
+            events = session["agent"].execute_stream(message, draft=draft)
+        proposal = None  # 暂存工具提议，模型失败时不能把半成品写入业务库。
+        answer = None  # 最终回答等草稿保存成功后才发出。
+        failed = False
+        for event in events:
+            if event["type"] == "draft_proposal":
+                proposal = event["content"]  # 内部事件不直接发给页面。
+            elif event["type"] == "answer":
+                answer = event
+            else:
+                if event["type"] == "error":
+                    failed = True
+                yield event  # status/reset/delta 继续实时显示。
+        if failed or answer is None or not answer["content"]:
+            session["agent"] = None  # 不沿用未完成推理，也不保存它的提议。
+            if not failed:
+                yield {"type": "error", "content": "未收到完整回答，草稿未更新，请重试。"}
+            return
+        if draft is not None and proposal is not None and proposal != draft["data"]:
+            try:
+                # 写事务重新核对身份、归属、状态和旧版本；不会覆盖另一个页面的新修改。
+                saved = save_task_draft(user_id, role, task_id, draft["revision"], proposal)
+            except (PermissionError, RuntimeError, ValueError):
+                session["agent"] = None  # 提议没存成，不能让后续记忆把它当成成功。
+                yield {"type": "error", "content": "本轮草稿未保存：任务权限、状态或草稿内容已变化，请重新加载草稿后重试。"}
+                return
+            yield {"type": "draft", "content": saved}  # 页面只接收后端确认保存的新版本。
+        yield answer
     except GeneratorExit:
         # 页面中途断开时也丢弃未完成的推理记忆，下次从干净状态继续。
         session["agent"] = None
         raise
-    except Exception:
-        logger.exception("Agent 对话处理失败")
+    except Exception as error:
+        # 工具参数错误可能含患者原话；这里只记类型，不输出原始参数或异常堆栈。
+        logger.error("Agent 对话处理失败，错误类型：%s", type(error).__name__)
         # 失败的一轮可能留下未完成的工具调用，下一次使用新的 Agent。
         session["agent"] = None
         yield {"type": "error", "content": "本次回答失败，请重试；若持续失败，请检查后端模型配置和日志。"}

@@ -1,5 +1,7 @@
 from langchain_core.tools import tool
 from langchain.tools import ToolRuntime
+from utils.draft_store import DraftFields
+from agent.tools.draft_collection import propose_draft_changes
 
 from rag.rag_service import RagService
 from utils.followup_store import (
@@ -58,6 +60,25 @@ def get_my_recent_records(runtime: ToolRuntime) -> list[dict]:
         role=runtime.context["role"],
         task_id=runtime.context.get("task_id"),  # 限定当前任务，不能把其他任务的记录混进来。
     )
+
+
+@tool(description="提议本次患者原话中的随访采集字段及逐字段原话依据；省略未提到的字段，不补齐缺项，不正式提交")
+def propose_followup_draft(updates: DraftFields, evidence: dict[str, str], runtime: ToolRuntime) -> dict:
+    """updates 只填本轮明确说明的字段；evidence 按同名字段提供原话片段。
+
+    例：updates={"systolic_bp":138}, evidence={"systolic_bp":"大压138"}。
+    evidence 必须保留完整原话子句；文本值与原话子句相同，不能截掉“没有”等字。
+    测量情况 measured/not_measured；服药情况 regular/missed/not_prescribed。
+    measured_at、symptoms、missed_dose_reason、adverse_effects 保留原话。
+    返回候选数据和缺项；不写数据库，校验失败返回提示供模型追问。
+    """
+    try:
+        # exclude_unset 只保留模型明确提供的字段；未提供不是“清空”。
+        with runtime.context["draft_lock"]:  # 两个并行提议依次合并，不互相覆盖字段。
+            return propose_draft_changes(runtime.context, updates.model_dump(exclude_unset=True), evidence)
+    except ValueError:
+        # 不回显含患者原话的校验异常，避免它进入监控日志。
+        return {"error": "草稿提议未通过校验。只提议本轮明确字段，逐字段附原话；有歧义先追问，不猜测、不清空已知值。"}
 
 
 @tool(description="检索公共高血压知识库，返回医学参考片段及来源；不能查询个人病历")
