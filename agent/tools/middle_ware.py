@@ -18,7 +18,7 @@ def monitor_tool(
 ) -> ToolMessage | Command:
 
     logger.info(f"[tool monitor]执行工具: {request.tool_call['name']}")
-    logger.info(f"[tool monitor]传入参数: {request.tool_call['args']}")
+    # 记录工具名称即可，参数可能含患者描述，不把完整健康信息写入日志。
 
     try:
         # 真正开始执行工具
@@ -40,7 +40,7 @@ def log_before_model(
 ):
     logger.info(f"[log_before_model]即将调用模型，带有{len(state['messages'])}条消息。")
 
-    logger.debug(f"[log_before_model]{type(state['messages'][-1]).__name__} | {state['messages'][-1].content}")
+    # 只记录消息数量，不记录聊天正文、密码或登录凭证。
 
     return None
 

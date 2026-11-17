@@ -1,4 +1,4 @@
-CHAT_MODEL_NAME: "qwen3.8-27b"  # 大模型
+CHAT_MODEL_NAME: "qwen4-max"  # 大模型
 EMBEDDING_MODEL_NAME: "qwen3.7-text-embedding-flash"  # 文本转向量模型
 BASE_URL: "https://dashscope.aliyuncs.com/compatible-mode/v1"
 BATCH_SIZE: 20

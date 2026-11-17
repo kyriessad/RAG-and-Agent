@@ -1,1 +1,2 @@
-external_data_path: data/external/records.csv
+# Streamlit 通过这个地址访问 FastAPI，数据库和模型只由后端使用。
+backend_url: http://127.0.0.1:8000

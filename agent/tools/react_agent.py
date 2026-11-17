@@ -3,24 +3,43 @@ from uuid import uuid4
 from langgraph.checkpoint.memory import InMemorySaver
 from model.factory import chat_model
 from utils.prompt_loader import load_system_prompts
-from agent.tools.agent_tools import (rag_search, get_weather,
-                                     get_available_months, fetch_external_data, fill_context_for_report)
+from agent.tools.agent_tools import (
+    rag_search, get_my_followup_tasks, get_my_discharges,
+    get_my_recent_records, fill_context_for_report,
+)
 from agent.tools.middle_ware import monitor_tool, log_before_model, report_prompt_switch
 from langchain_core.messages import AIMessage, ToolMessage, AIMessageChunk
 from langchain.agents.middleware import ToolCallLimitMiddleware
 
 
 class ReactAgent:
-    def __init__(self, user_id: int):
+    def __init__(self, user_id: str, role: str, task_id: str | None = None):
+        """创建当前身份和任务的 Agent；不提交任何业务记录。
+
+        输入示例：user_id="U001"、role="patient"、task_id="F001"。
+        task_id=None 保留通用查询；有编号时，工具只能读取该授权任务范围。
+        构造函数不返回业务数据，创建结果是具有独立记忆的 ReactAgent 对象。
+        模型或框架配置异常由外层 chat_session 捕获并转为错误事件。
+        """
         # 创建对象时生成一次，后续提问继续使用它
         self.thread_id = str(uuid4())  # uuid4()：生成一个随机的唯一标识，用来区分会话。 eg: 0517a8d6-693e-4a4d-a8d3-3f5ff53cf4f8
         self.user_id = str(user_id)  # 是这个用户在用 agent
+        self.role = role  # 字符串：patient 表示患者，doctor 表示医生。
+        self.task_id = task_id  # str 或 None：由后端校验归属的任务编号，不从聊天文字提取。
+
+        # 身份由后端查登录凭证得到，模型只能选择查询工具，不能指定其他用户。
+        medical_tools = [
+            rag_search, get_my_followup_tasks, get_my_discharges,
+            get_my_recent_records,
+        ]
+        # 患者只查询信息；报告草稿辅助工具仅提供给医生。
+        if role == "doctor":
+            medical_tools.append(fill_context_for_report)
 
         self.agent = create_agent(
             model=chat_model,
             system_prompt=load_system_prompts(),
-            tools=[rag_search, get_weather,
-                   get_available_months, fetch_external_data, fill_context_for_report],
+            tools=medical_tools,
             middleware=[monitor_tool, log_before_model, report_prompt_switch,
                         ToolCallLimitMiddleware(
                             run_limit=7,
@@ -31,6 +50,13 @@ class ReactAgent:
         )
 
     def execute_stream(self, query: str):
+        """输入一条问题文本，逐个输出页面约定的聊天事件。
+
+        例如 query="这次随访什么时候到期？"，输出 status、delta、answer 等字典。
+        user_id、role、task_id 使用创建对象时保存的服务端值，不从问题中提取。
+        本方法会调用模型和只读工具、更新当前 Agent 的内存；不提交随访记录。
+        推理或工具异常交给 chat_session 处理，未完成的回答不能作为正常结果保存。
+        """
         input_dict = {
             "messages": [
                 {"role": "user", "content": query}
@@ -38,11 +64,11 @@ class ReactAgent:
         }
 
         tool_names = {
-            "get_available_months": "查询可用月份",
-            "fetch_external_data": "查询使用记录",
-            "fill_context_for_report": "准备生成报告",
-            "rag_search": "检索知识库",
-            "get_weather": "查询天气",
+            "get_my_followup_tasks": "查询随访任务",
+            "get_my_discharges": "查询出院信息",
+            "get_my_recent_records": "查询近期血压记录",
+            "fill_context_for_report": "整理报告草稿",
+            "rag_search": "检索高血压知识库",
         }
 
         shown_tool_calls = set()
@@ -61,6 +87,9 @@ class ReactAgent:
                 context={
                     "report": False,
                     "user_id": self.user_id,
+                    "role": self.role,
+                    # ToolRuntime 会接收这个值；模型的工具参数中不开放任务范围。
+                    "task_id": self.task_id,
                 },
                 config={
                     "configurable": {
@@ -124,8 +153,4 @@ class ReactAgent:
         }
 
 
-if __name__ == '__main__':
-    agent = ReactAgent(user_id=1001)
-
-    for chunk in agent.execute_stream("1 + 1 等于几？"):
-        print(chunk, end="", flush=True)
+# 请通过 backend.py 的登录接口使用 Agent，避免调试入口绕过身份验证。
