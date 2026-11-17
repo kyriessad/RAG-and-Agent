@@ -141,6 +141,134 @@ def load_draft_fields(draft):
         st.session_state["draft_field_" + field] = value  # 控件 key 保持稳定，普通重跑不重置输入。
 
 
+def show_risk_notice(content):
+    """展示规则提醒，输入含 risk 和 notification_saved 的字典，返回 None。
+
+    例如 risk.level="high" 时显示就医提示；不调用模型、不发请求、不修改病历。
+    提醒独立于模型回答，模型失败或清除临时回答时仍须保留。
+    """
+    risk = content.get("risk", {})  # 缺少规则结果时不推断为安全或低风险。
+    message = risk.get("patient_message", "")  # 文案由服务端规则决定，页面不判断血压。
+    if risk.get("level") == "high" and message:
+        st.error(message)  # 明确红旗提示使用醒目的样式。
+    elif risk.get("level") == "attention" and message:
+        st.warning(message)  # 需要关注但未命中红旗的规则提示。
+    if risk.get("level") in ("high", "attention"):
+        for reason in risk.get("reasons", []):
+            st.write("触发原因：" + reason)  # 保留可解释的规则依据，不展示推理过程。
+        if content.get("notification_saved") is False:
+            st.warning("医生站内提醒尚未保存成功，请直接联系医生；不要等待助手回答。")
+
+
+def show_cached_task_risk(task_id):
+    """读取当前任务已收到的规则结果并展示，返回 None；不请求网络、不重新判定风险。
+
+    用于任务归属已确认但草稿暂时读取失败的情况；另一任务的缓存不展示。
+    身份或权限失效时由调用处先清缓存，不能拿缓存替代授权。
+    """
+    displayed = []  # 同一风险只展示一次，但通知保存失败提示仍需保留。
+    for key in ("draft_risk_event", "draft_loaded_risk"):
+        content = st.session_state.get(key)
+        if content is None or content.get("task_id") != task_id:
+            continue  # 每份缓存明确绑定任务，不依赖页面当前显示的位置。
+        risk = content.get("risk", {})
+        if risk not in displayed:
+            show_risk_notice(content)
+            displayed.append(risk)
+
+
+def show_failed_draft_risk(error, task_id):
+    """从草稿保存失败的响应提取风险提醒，返回 None；只保存页面内存，不写业务库。
+
+    输入为 PUT 异常和已授权任务；错误正文可含 risk、notification_saved=False。
+    无响应、没有风险字段或权限失效时不推断新风险，也不缓存错误正文中的患者信息。
+    """
+    response = error.response
+    if response is None or response.status_code not in (409, 422, 503):
+        return  # 401/403/404 必须走权限处理，不能据此恢复旧提醒。
+    if st.session_state.get("user", {}).get("role") != "patient":
+        return  # 仅患者任务草稿保存调用这里，不把它扩展成所有接口的通用缓存。
+    if st.session_state.get("selected_task", {}).get("task_id") != task_id:
+        return  # 保存失败期间任务已切换时，不能混入另一项任务的信息。
+    try:
+        payload = response.json()
+    except ValueError:
+        return  # HTML 等非 JSON 错误没有可用的规则结果。
+    if not isinstance(payload, dict) or not isinstance(payload.get("risk"), dict):
+        return  # 兼容原有仅含 detail 的错误，不凭错误类型生成就医结论。
+    if payload["risk"].get("level") != "high":
+        return
+    content = {"task_id": task_id, "risk": payload["risk"], "notification_saved": False}
+    st.session_state["draft_risk_event"] = content  # 写库失败仍保留服务端已经检查出的危险信号。
+    show_risk_notice(content)  # 当轮立即显示，不能等下一次 GET 或模型回答。
+
+
+def show_patient_submit(token, task_id, latest, base):
+    """让患者确认并提交已保存的草稿，返回 None；仅点击按钮时发送 POST。
+
+    输入为登录凭证、任务编号和草稿接口结果；提交体例如
+    {"expected_revision": 2, "confirmed": True}，不发送未保存的表单或指定风险。
+    缺项、版本变化或页面有改动时不能提交；失败保留输入，不自动重试。
+    """
+    values = {}  # 当前显示内容也是确认依据；编辑后必须重新确认。
+    for field in draft_display_values(base["data"]):
+        values[field] = st.session_state.get("draft_field_" + field)
+    signature = {"task_id": task_id, "revision": base["revision"],
+                 "server_revision": latest["revision"], "editable": latest["editable"],
+                 "values": values}  # 普通字典比较，明确区分服务器版本和当前显示。
+    if st.session_state.get("draft_confirm_signature") != signature:
+        st.session_state["draft_confirm"] = False  # 内容或版本变动使以前的确认失效。
+        st.session_state["draft_confirm_signature"] = signature
+    if st.session_state.pop("draft_reset_confirmation", False):
+        st.session_state["draft_confirm"] = False  # 提交失败后，下一轮先取消旧确认。
+    can_submit = latest["editable"] and not latest["missing_fields"]
+    if draft_has_changes() or latest["revision"] != base["revision"]:
+        can_submit = False  # 页面不把尚未保存的内容说成已经提交。
+    if not can_submit:
+        st.session_state["draft_confirm"] = False  # 禁用时不保留可能过期的勾选。
+    st.divider()
+    st.write("确认本次随访信息")
+    confirmed = st.checkbox("我已核对上面的信息，确认提交本次随访", key="draft_confirm",
+                            disabled=not can_submit)  # 默认不勾选，不代替患者确认。
+    if st.button("确认提交随访", key="draft_submit", disabled=not can_submit or not confirmed):
+        try:
+            result = request_api("POST", f"/tasks/{task_id}/submit", token=token, data={
+                "expected_revision": base["revision"], "confirmed": True,
+            }).json()  # 服务端独立检查归属、版本、缺项和重复请求。
+        except requests.RequestException as error:
+            st.session_state["draft_reset_confirmation"] = True
+            show_request_error(error)  # 输入保持原样，不把错误当成成功。
+            st.warning("请重新加载确认提交结果；连接中断时，后端可能已经保存，请勿反复点击。")
+        else:
+            st.session_state["draft_submit_notice"] = result  # 下一轮展示成功并读取实时状态。
+            st.session_state["draft_reload"] = True
+            st.rerun()  # 重跑只发 GET，不重复调用提交接口。
+
+
+def show_doctor_notifications(token):
+    """通过 GET /notifications 展示当前医生的风险通知，返回 None；不审核或修改通知。
+
+    列表由后端按负责医生授权；例如 [{task_id: F001, patient_name: 张某, message: ...}]。
+    请求失败只展示错误和刷新按钮，不能使用其他账号的旧通知。
+    """
+    st.subheader("风险通知")
+    if st.button("刷新风险通知", key="reload_notifications"):
+        st.rerun()  # 重新请求服务端，不在页面缓存通知列表。
+    try:
+        notifications = request_api("GET", "/notifications", token=token).json()
+    except requests.RequestException as error:
+        show_request_error(error)
+        return  # 通知加载失败不假装没有通知。
+    if not notifications:
+        st.info("当前没有风险通知。")
+    for notification in notifications:
+        st.write("患者：", notification.get("patient_name", "未提供"))
+        st.write("随访任务：", notification["task_id"])
+        st.warning(notification["message"])  # 保留通知原文，不由页面生成医学意见。
+        st.caption("通知时间：" + notification["created_at"])
+        st.divider()
+
+
 def show_patient_draft(token, task_id):
     """读取、展示并修改当前患者草稿，返回 None；通过 GET/PUT 读写 task_drafts。
 
@@ -152,8 +280,10 @@ def show_patient_draft(token, task_id):
     try:
         latest = request_api("GET", path, token=token).json()  # 重进页面可恢复数据库里的草稿。
     except requests.RequestException as error:
-        if error.response is not None and error.response.status_code in (403, 404):
+        if error.response is not None and error.response.status_code in (401, 403, 404):
             clear_task_selection()  # 权限失效后不能继续展示旧草稿。
+        else:
+            show_cached_task_risk(task_id)  # 数据库暂不可读时，已收到的就医提醒仍然有效。
         show_request_error(error)
         if st.button("重新加载草稿", key="draft_retry"):
             st.rerun()
@@ -171,6 +301,20 @@ def show_patient_draft(token, task_id):
             st.session_state[key] = value  # 仅恢复请求失败期间被清掉的控件，不覆盖本轮新输入。
     st.subheader("我的随访信息草稿")
     st.caption("空白表示还没说明，可以先保存部分信息。保存草稿不等于正式提交。")
+    if latest.get("risk", {}).get("level") == "high":
+        st.session_state["draft_loaded_risk"] = {"task_id": task_id, "risk": latest["risk"]}
+    else:
+        st.session_state.pop("draft_loaded_risk", None)  # 当前已读结果更新，历史提醒仍由 alerts 保存。
+    show_risk_notice({"risk": latest.get("risk", {})})  # 规则结果不是模型回答，不会被聊天 reset 清空。
+    for alert in latest.get("alerts", []):  # 读取持久通知，重新登录后仍能看到已触发提醒。
+        st.warning("此前触发的提醒：" + alert["message"])
+        st.caption("提醒时间：" + alert["created_at"])
+    recent_risk = st.session_state.get("draft_risk_event")  # 通知保存失败时也保留刚收到的就医提示。
+    if recent_risk and recent_risk.get("task_id") == task_id and (recent_risk.get("risk") != latest.get("risk") or recent_risk.get("notification_saved") is False):
+        show_risk_notice(recent_risk)
+    submitted = st.session_state.pop("draft_submit_notice", None)
+    if submitted is not None:
+        st.success("本次随访已提交，记录已保存。")  # 不把提交说成医生已经审核或发布报告。
     for note in latest.get("notes", []):  # 例如旧记录只写“已服药”，尚不能确定是否按时。
         st.info(note)  # 只展示核对提示，输入框仍保持未说明，直到患者自己确认。
     if st.session_state.pop("draft_saved_notice", False):
@@ -213,6 +357,11 @@ def show_patient_draft(token, task_id):
                 "expected_revision": base["revision"], "data": data,
             })  # 例如 revision=2；如果服务器已是 3，必须拒绝覆盖。
         except requests.RequestException as error:
+            if error.response is not None and error.response.status_code in (401, 403, 404):
+                clear_task_selection()  # 写入阶段也可能撤权，立即清除旧草稿和风险缓存。
+                show_request_error(error)
+                st.stop()
+            show_failed_draft_risk(error, task_id)  # 规则提醒独立于写库成功，不被保存失败吞掉。
             show_request_error(error)
             if error.response is not None and error.response.status_code == 409:
                 st.warning("未覆盖服务器草稿。当前输入仍保留，请核对后重新加载。")
@@ -220,6 +369,7 @@ def show_patient_draft(token, task_id):
             st.session_state["draft_reload"] = True  # 下一轮控件创建前再更新，避免修改已创建的控件。
             st.session_state["draft_saved_notice"] = True
             st.rerun()
+    show_patient_submit(token, task_id, latest, base)  # 提交与保存草稿是两个明确的操作。
 
 
 def clear_login():
@@ -385,8 +535,11 @@ def show_patient_tasks(token):
     st.session_state["selected_task"] = task_detail
     st.subheader(f"当前随访任务：{task_detail['task_id']}")
     show_task_details(task_detail)
-    # 第二步只保存业务草稿，不把聊天或保存按钮说成正式提交。
-    st.info("可以和助手聊聊本次情况，再检查、修改并保存草稿；暂不能正式提交随访信息。")
+    # 状态来自后端；提交后的记录只读，不能把保存草稿当成正式提交。
+    if task_detail["task_status"] in ("pending", "in_progress", "needs_info"):
+        st.info("可以和助手聊聊本次情况，检查并保存草稿后，再确认提交随访信息。")
+    else:
+        st.info("这项任务已提交或结束，当前信息仅供查看。")
     if st.button("返回任务列表", key="return_tasks"):
         if draft_has_changes():
             st.warning("还有未保存的修改，请先保存草稿，或明确放弃当前修改后再返回。")
@@ -585,6 +738,8 @@ current_task = None
 if user["role"] == "patient":
     current_task = show_patient_tasks(token)
     show_patient_draft(token, current_task["task_id"])  # 只通过 HTTP 读写草稿，前端不连接数据库。
+else:
+    show_doctor_notifications(token)  # 医生只读风险通知，不在此处审核或发布报告。
 
 # ==================== 用历史数据重新画出聊天消息 ====================
 # message = {"role":"assistant","content":"你好"}。
@@ -596,7 +751,11 @@ for message in st.session_state.get("message", []):
         st.markdown(message["content"])
 
 # ==================== 接收这一轮新问题 ====================
-prompt = st.chat_input("请输入你的问题或本次随访情况", max_chars=4000, disabled=draft_has_changes())
+chat_disabled = draft_has_changes()  # 未保存输入不能与聊天提议相互覆盖。
+if current_task is not None and current_task["task_status"] not in ("pending", "in_progress", "needs_info"):
+    chat_disabled = True  # 已提交或完成的任务停止采集，历史仍供查看。
+risk_box = st.container()  # 单独放置规则提醒，避免模型 reset/error 清除患者需要看到的信息。
+prompt = st.chat_input("请输入你的问题或本次随访情况", max_chars=4000, disabled=chat_disabled)
 if prompt and prompt.strip():
     # chat_message(...).write(prompt) 是先创建用户消息容器，再在其中写入文字。
     st.chat_message("user").write(prompt)
@@ -646,7 +805,7 @@ if prompt and prompt.strip():
                     event_type = event["type"]
                     content = event["content"]
 
-                    # event_type 是 str；draft 事件的 content 是字典，其余事件正文是 str。
+                    # event_type 是 str；draft/risk 事件正文是字典，其他事件正文是 str。
                     # 这几个字符串是前后端约定的事件名，不是 Streamlit 自动规定的。
                     # 一轮可能有多次工具调用，因此不保证每种事件都只出现一次。
                     # 工具状态与回答分别放置，例如“正在检索高血压知识库”。
@@ -675,6 +834,13 @@ if prompt and prompt.strip():
                         # 事件只提示后端已保存；页面重跑后再从草稿接口取最新内容与版本。
                         if current_task is not None and content["task_id"] == current_task["task_id"]:
                             draft_updated = True
+                    elif event_type == "risk":
+                        if current_task is not None:
+                            content = dict(content)  # 另存任务编号，不改变刚解析的事件原文。
+                            content["task_id"] = current_task["task_id"]
+                            st.session_state["draft_risk_event"] = content  # 重跑仍保留，不加入成功助手回答。
+                            with risk_box:
+                                show_risk_notice(content)  # 立即展示，不等模型完成或患者正式提交。
                     elif event_type == "error":
                         # HTTP 已经返回 200 开始传流后，模型仍可能失败。
                         # 因此即使 HTTP 状态正常，也必须检查流中的 error 事件。

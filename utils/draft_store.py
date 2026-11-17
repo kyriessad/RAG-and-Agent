@@ -7,6 +7,8 @@ from typing import Literal  # 固定选项同时生成工具和接口的字段�
 from pydantic import BaseModel, ConfigDict, Field
 
 from utils.user_store import get_connection
+from utils.risk_rules import evaluate_risk
+from utils.risk_store import list_task_risk_alerts, save_risk_notification
 
 
 class DraftFields(BaseModel):
@@ -148,6 +150,7 @@ def read_draft(conn, task_id, task_status):
     """在已授权的连接上读取草稿，返回接口字典；不存在返回版本 0，不创建记录。
 
     已知旧字段在内存中兼容，不改原记录；未知或损坏格式仍抛数据库错误。
+    同时返回当前字段的规则结果和历史提醒，读取本身不会生成新通知。
     """
     row = conn.execute("SELECT draft_json, revision FROM task_drafts WHERE task_id = ?", (task_id,)).fetchone()
     revision = 0  # 尚未保存的页面草稿以版本 0 表示。
@@ -163,6 +166,8 @@ def read_draft(conn, task_id, task_status):
     return {"task_id": task_id, "revision": revision, "data": data,
             "missing_fields": missing_draft_fields(data),
             "notes": stored_draft_notes(stored, data),  # 旧服药布尔值需要患者再次确认。
+            "risk": evaluate_risk(data=data),  # 只读规则结果；缺项不判成安全。
+            "alerts": list_task_risk_alerts(conn, task_id),  # 重新登录后仍能看到历史升级提醒。
             "editable": task_status in ("pending", "in_progress", "needs_info")}
 
 
@@ -182,7 +187,7 @@ def get_task_draft(user_id, role, task_id):
 
 
 def save_task_draft(user_id, role, task_id, expected_revision, data):
-    """验证并保存完整采集草稿，返回新版本；只写 task_drafts，不提交随访。
+    """验证并保存完整采集草稿，返回新版本；必要时保存风险通知，但不正式提交随访。
 
     输入旧版本 0，首次成功返回版本 1。越权抛 PermissionError；
     旧版本/任务不可编辑抛 RuntimeError；字段错误抛 ValueError；失败自动回滚。
@@ -213,9 +218,13 @@ def save_task_draft(user_id, role, task_id, expected_revision, data):
         else:
             conn.execute("UPDATE task_drafts SET draft_json=?, revision=?, needs_clarification=? WHERE task_id=?",
                          (payload, revision, needs_clarification, task_id))
-        conn.commit()  # 全部检查通过才持久保存；不改变 followup_tasks/followup_records。
+        risk = evaluate_risk(data=data)  # 手工和 Agent 草稿都必须经过同一套独立风险规则。
+        save_risk_notification(conn, user_id, task_id, risk, "采集草稿，尚未经确认提交")
+        alerts = list_task_risk_alerts(conn, task_id)  # 查询本事务刚写入的通知，随草稿一起交给页面。
+        conn.commit()  # 草稿与必要通知一起保存；不改变 followup_tasks/followup_records。
         return {"task_id": task_id, "revision": revision, "data": data,
-                "missing_fields": missing, "notes": stored_draft_notes(stored, data), "editable": True}
+                "missing_fields": missing, "notes": stored_draft_notes(stored, data), "editable": True,
+                "risk": risk, "alerts": alerts}
     except Exception:
         conn.rollback()  # 错误时保持此前的草稿与版本。
         raise
