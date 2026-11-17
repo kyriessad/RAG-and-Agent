@@ -146,6 +146,7 @@ def show_patient_draft(token, task_id):
 
     输入是登录凭证与任务编号。保存发送 expected_revision 和完整 data 字典。
     无权访问或连接失败时停止当前页面；冲突保留本地输入，不自动重试覆盖。
+    旧记录含义不够明确时显示后端的 notes 提示，请患者核对，不自动替患者选择。
     """
     path = f"/tasks/{task_id}/draft"  # 例如 /tasks/F001/draft，任务归属仍由后端校验。
     try:
@@ -170,6 +171,8 @@ def show_patient_draft(token, task_id):
             st.session_state[key] = value  # 仅恢复请求失败期间被清掉的控件，不覆盖本轮新输入。
     st.subheader("我的随访信息草稿")
     st.caption("空白表示还没说明，可以先保存部分信息。保存草稿不等于正式提交。")
+    for note in latest.get("notes", []):  # 例如旧记录只写“已服药”，尚不能确定是否按时。
+        st.info(note)  # 只展示核对提示，输入框仍保持未说明，直到患者自己确认。
     if st.session_state.pop("draft_saved_notice", False):
         st.success("草稿已保存，可继续补充或修改。")
     if latest["revision"] != base["revision"]:

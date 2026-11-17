@@ -82,6 +82,48 @@ def missing_draft_fields(data):
     return missing
 
 
+def normalize_stored_draft(stored):
+    """把数据库里的新旧草稿转为当前字段字典；不改输入、不写库、不调用模型。
+
+    例如旧 missed_reason="忘带药" 对应新 missed_dose_reason="忘带药"。
+    新字段已存在时以它为准，包括患者明确保存的 None，不能用旧值重新填回。
+    只兼容已知的四个旧字段；未知键、错误类型仍抛 ValueError。
+    """
+    if not isinstance(stored, dict):  # JSON 数组、字符串等都不是草稿字段字典。
+        raise ValueError("保存的草稿必须是字段字典。")
+    data = dict(stored)  # 在副本上整理，原字典供后续保存时保留旧信息。
+    heart_rate = data.pop("heart_rate", None)  # 旧心率暂不进入当前表单，但不能从数据库丢掉。
+    if heart_rate is not None and type(heart_rate) is not int:  # 排除字符串和布尔值。
+        raise ValueError("旧草稿的心率格式无法读取。")
+    medication_taken = data.pop("medication_taken", None)  # 旧布尔值仅表示是否服药。
+    if medication_taken is not None and type(medication_taken) is not bool:
+        raise ValueError("旧草稿的服药记录格式无法读取。")
+    # 已服药不等于一直按时服药，未服药也不一定代表漏服，因此不推断 adherence。
+    aliases = {"missed_reason": "missed_dose_reason", "adverse_reactions": "adverse_effects"}
+    for old_name, new_name in aliases.items():  # 只有含义相同的旧文字字段才转换名称。
+        old_value = data.pop(old_name, None)  # 删除的只是副本里的旧键，原数据仍保留。
+        if old_value is not None and not isinstance(old_value, str):
+            raise ValueError("旧草稿的原因或不适描述格式无法读取。")
+        if new_name not in data:  # 新字段为 None 也算已存在，尊重患者主动清空。
+            data[new_name] = old_value
+    return validate_draft(data)  # 仍严格检查当前字段和组合，不忽略其他未知键。
+
+
+def stored_draft_notes(stored, data):
+    """输入原始存储字典和当前字段，输出给患者的提示列表；无读写或网络操作。
+
+    旧 medication_taken=True 且当前服药情况未说明时，提示核对，不替患者选择。
+    """
+    notes = []  # 当前格式或没有旧服药记录时，返回空列表。
+    taken = stored.get("medication_taken")  # 读取阶段已核对它只能是 bool 或 None。
+    if data["medication_adherence"] is None and taken is not None:
+        description = "未服药"  # 保留旧记录含义，不解释成漏服或未开药。
+        if taken:
+            description = "已服药"
+        notes.append(f"此前仅记录了“{description}”，还不能确定是否按时服药，请核对下方的“最近服药情况”。")
+    return notes
+
+
 def require_patient_task(conn, user_id, role, task_id):
     """用当前连接核对患者、任务及实时角色，返回状态；越权或不存在均抛 PermissionError。
 
@@ -105,19 +147,22 @@ def require_patient_task(conn, user_id, role, task_id):
 def read_draft(conn, task_id, task_status):
     """在已授权的连接上读取草稿，返回接口字典；不存在返回版本 0，不创建记录。
 
-    内容无法解析时抛数据库错误，避免把损坏或不兼容的旧草稿当成空白覆盖。
+    已知旧字段在内存中兼容，不改原记录；未知或损坏格式仍抛数据库错误。
     """
     row = conn.execute("SELECT draft_json, revision FROM task_drafts WHERE task_id = ?", (task_id,)).fetchone()
     revision = 0  # 尚未保存的页面草稿以版本 0 表示。
     data = DraftFields().model_dump()  # 所有字段都是 None，没有默认血压或默认症状。
+    stored = {}  # 保留原始字段供提示使用，读取接口不回写数据库。
     if row is not None:
         try:
-            data = validate_draft(json.loads(row["draft_json"]))
+            stored = json.loads(row["draft_json"])  # JSON 文本变成字典；坏 JSON 仍报错。
+            data = normalize_stored_draft(stored)  # 兼容旧格式只用于读库，不放宽新请求校验。
             revision = row["revision"]
         except ValueError as error:
             raise sqlite3.DatabaseError("已有草稿格式无法读取，请检查后端记录。") from error
     return {"task_id": task_id, "revision": revision, "data": data,
             "missing_fields": missing_draft_fields(data),
+            "notes": stored_draft_notes(stored, data),  # 旧服药布尔值需要患者再次确认。
             "editable": task_status in ("pending", "in_progress", "needs_info")}
 
 
@@ -141,6 +186,7 @@ def save_task_draft(user_id, role, task_id, expected_revision, data):
 
     输入旧版本 0，首次成功返回版本 1。越权抛 PermissionError；
     旧版本/任务不可编辑抛 RuntimeError；字段错误抛 ValueError；失败自动回滚。
+    已有旧字段保留原值，新字段作为当前值；例如清空 missed_dose_reason 后不会恢复旧原因。
     """
     data = validate_draft(data)  # 手工表单与模型提议经过同一套类型、组合检查。
     conn = get_connection()
@@ -155,8 +201,12 @@ def save_task_draft(user_id, role, task_id, expected_revision, data):
         revision = current["revision"] + 1  # 版本由后端增加，不由模型或页面决定。
         missing = missing_draft_fields(data)
         needs_clarification = int(bool(missing))  # 有缺项为 1，已回答所需字段为 0。
-        payload = json.dumps(data, ensure_ascii=False)  # 只保存规范字段，不存模型原始回答。
-        row = conn.execute("SELECT task_id FROM task_drafts WHERE task_id = ?", (task_id,)).fetchone()
+        row = conn.execute("SELECT draft_json FROM task_drafts WHERE task_id = ?", (task_id,)).fetchone()
+        stored = {}  # 新草稿只保存当前规范字段，不保存模型原始回答。
+        if row is not None:
+            stored = json.loads(row["draft_json"])  # read_draft 已校验；保留旧心率等历史字段。
+        stored.update(data)  # 全部当前字段覆盖同名旧值，包括患者明确清空的 None。
+        payload = json.dumps(stored, ensure_ascii=False)  # 原有旧键保留，新读取逻辑优先使用当前键。
         if row is None:
             conn.execute("INSERT INTO task_drafts(task_id, draft_json, revision, needs_clarification) VALUES(?,?,?,?)",
                          (task_id, payload, revision, needs_clarification))
@@ -165,7 +215,7 @@ def save_task_draft(user_id, role, task_id, expected_revision, data):
                          (payload, revision, needs_clarification, task_id))
         conn.commit()  # 全部检查通过才持久保存；不改变 followup_tasks/followup_records。
         return {"task_id": task_id, "revision": revision, "data": data,
-                "missing_fields": missing, "editable": True}
+                "missing_fields": missing, "notes": stored_draft_notes(stored, data), "editable": True}
     except Exception:
         conn.rollback()  # 错误时保持此前的草稿与版本。
         raise
