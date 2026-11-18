@@ -1,35 +1,64 @@
 """FastAPI 入口：验证身份、接收参数，再调用 utils 和 Agent。"""
+# 给内存会话生成摘要键，退出时能精确找到该登录对应的 Agent。
 import hashlib
+# 聊天事件需要逐条编码成 JSON，不能等所有事件生成后才一次发送。
 import json
+# 捕获 SQLite 的表、连接或事务异常，统一转成前端可处理的 HTTP 状态。
 import sqlite3
 
+# Depends 会在路由执行前调用鉴权函数，HTTPException 会提前结束本次请求。
 from fastapi import Depends, FastAPI, HTTPException
+# 普通失败用 JSONResponse；聊天用 StreamingResponse 连续发送多行。
 from fastapi.responses import JSONResponse, StreamingResponse
+# HTTPBearer 读取 Authorization 请求头，例如 Bearer 后跟登录得到的随机串。
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+# BaseModel 描述请求体，Field 在进入业务函数前检查长度等条件。
 from pydantic import BaseModel, ConfigDict, Field
 
+# stream_chat 返回事件生成器；forget_session 清理当前 token 对应的内存记忆。
 from agent.tools.chat_session import forget_session, stream_chat
+# 账号查询和令牌撤销集中在 user_store，页面无需了解密码存储格式。
 from utils import user_store
+from utils import report_store  # 独立处理报告的授权查询、版本检查和事务。
+# 工具查询和 HTTP 查询复用相同的任务权限条件。
 from utils.followup_store import get_followup_task, list_followup_tasks
+# SaveDraftData 接收表单和旧版本，保存时仍允许暂时缺项。
 from utils.draft_store import SaveDraftData, get_task_draft, save_task_draft
+# 正式提交单独检查患者确认，成功后返回不可覆盖的记录编号。
 from utils.submission_store import SubmitDraftData, submit_task_draft
+# 医生工作台从 notifications 读取已经写入的风险通知。
 from utils.risk_store import list_doctor_notifications
+# 规则判断可以独立执行，即使后面的写库或模型调用失败也能提醒。
 from utils.risk_rules import evaluate_risk
 from utils.logger_handler import logger
 
+# FastAPI 启动时收集下方的路由，函数名无需与浏览器路径相同。
 app = FastAPI(title="高血压随访助手")
+# 缺少凭证时交给 current_user 返回统一的 401 提示。
 bearer = HTTPBearer(auto_error=False)
+
+
+# 装饰器注册错误处理函数；下方所有报告接口共享一套错误回复格式。
+@app.exception_handler(report_store.ReportError)
+async def report_error(request, error):
+    """把业务异常转换为统一的 HTTP 回复，如 409 表示需要刷新；不记录病历正文。"""
+    return JSONResponse(status_code=error.status, content={"detail": str(error)})
+
 
 
 class LoginData(BaseModel):
     # 这里只接收用户名和密码，不能通过请求指定 doctor 等角色。
+    # 例如登录请求里额外传入 role 会得到 422，不能伪造医生身份。
     model_config = ConfigDict(extra="forbid")
+    # 长度检查通过后，注册入口还会排除全空格用户名。
     username: str = Field(min_length=1, max_length=64)
+    # 密码只作为本次校验输入，成功响应不返回这个字段。
     password: str = Field(min_length=1, max_length=128)
 
 
 class ChatData(BaseModel):
     # 例如 {"message": "查一下本次安排", "task_id": "F001"}；user_id 不能由前端传入。
+    # 字符串先清理首尾空白，全空格的消息会在长度检查时被拒绝。
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
     message: str = Field(min_length=1, max_length=4000)
     # 不传 task_id 或传 null 表示普通聊天；传任务编号时，后端还要检查任务归属。
@@ -37,58 +66,82 @@ class ChatData(BaseModel):
 
 
 def current_user(credentials: HTTPAuthorizationCredentials = Depends(bearer)):
+    """读取请求头中的令牌，返回实时身份和会话键；凭证缺失或过期返回 401，只读库。"""
     # Depends 表示每个需要登录的接口都会先执行这个身份检查。
+    # 还没有 Authorization 请求头，不能执行后面的医疗查询。
     if credentials is None:
         raise HTTPException(status_code=401, detail="请先登录。")
+    # credentials.credentials 是令牌正文；查询 sessions 时由存储层计算哈希。
     user = user_store.get_current_user(credentials.credentials)
+    # 找不到令牌、登录过期或角色失效都需要重新登录。
     if user is None:
         raise HTTPException(status_code=401, detail="登录已失效，请重新登录。")
 
     # session_key 只在后端区分聊天会话，不作为用户可指定的参数。
     user["session_key"] = hashlib.sha256(credentials.credentials.encode()).hexdigest()
+    # 后续路由拿到 user 字典，通过 user_id 和 role 在数据库重新限制业务范围。
     return user
 
 
+# 注册底层数据库故障处理，避免前端把读取失败显示成“没有任务”。
 @app.exception_handler(sqlite3.Error)
 async def database_error(request, error):
+    """记录 SQLite 异常并返回 503 JSON，供页面提示稍后重试；不改业务状态。"""
     # 不向页面暴露数据库路径和 SQL；具体原因只写后端日志。
     logger.error("医疗数据库操作失败：%s", error)
     return JSONResponse(status_code=503, content={"detail": "医疗数据库暂时无法使用，请检查后端日志。"})
 
 
+# POST /auth/register 成功时返回 201，表示新建了患者登录账号。
 @app.post("/auth/register", status_code=201)
 def register(data: LoginData):
+    """接收用户名和密码，写入一个患者账号并返回提示；空用户名 422，重名 409。"""
     # 患者自主注册；医生使用医疗库中已经分配好角色的账号。
     if not data.username.strip():
         raise HTTPException(status_code=422, detail="用户名不能为空。")
+    # False 表示用户名冲突；数据库连接错误会向上传给统一错误处理。
     if not user_store.register_user(data.username, data.password):
         raise HTTPException(status_code=409, detail="用户名已存在。")
+    # 成功注册的患者需要登录后才能取得访问任务所需的凭证。
     return {"message": "注册成功，请登录。"}
 
 
+# POST 表示凭证放在请求体，避免密码出现在 URL 中。
 @app.post("/auth/login")
 def login(data: LoginData):
+    """核对账号密码，记录新会话并返回令牌及身份；登录失败返回 401。"""
+    # 存储层校验密码并插入一条有过期时间的登录会话。
     result = user_store.login_user(data.username, data.password)
+    # 统一登录失败提示，避免通过响应区分哪个用户名存在。
     if result is None:
         raise HTTPException(status_code=401, detail="用户名或密码错误，或账号未开通医患访问权限。")
+    # 成功形状示例 {"access_token":"…","user":{"user_id":"U1","role":"patient",…}}。
     return result
 
 
+# 每次 Streamlit 重跑都可 GET /me 重新核对身份。
 @app.get("/me")
 def me(user: dict = Depends(current_user)) -> dict:
+    """返回当前用户的三个公开身份字段，供页面核对登录状态；本接口不写库。"""
     # 只返回页面展示需要的账号信息，不返回密码哈希或内部会话键。
     return {"user_id": user["user_id"], "username": user["username"], "role": user["role"]}
 
 
+# logout 同时需要身份和原始令牌，才能清理数据库与聊天内存。
 @app.post("/auth/logout")
 def logout(user: dict = Depends(current_user), credentials: HTTPAuthorizationCredentials = Depends(bearer)):
+    """撤销当前登录令牌并删除对应的内存会话；成功返回退出提示。"""
+    # 删除对应 sessions 行后，此 token 下次访问就会收到 401。
     user_store.logout_user(credentials.credentials)
+    # 使用令牌摘要定位这次登录的 Agent，不影响同账号的其他设备。
     forget_session(user["session_key"])
     return {"message": "已退出登录。"}
 
 
+# GET /tasks 没有身份参数，即使医生查任务也只用服务器确认的身份。
 @app.get("/tasks")
 def tasks(user: dict = Depends(current_user)):
+    """读取登录患者或负责医生可以进入的任务；没有关联任务时返回空列表。"""
     # 查询和归属过滤写在 utils，路由只转交服务端已确认的身份。
     return list_followup_tasks(user["user_id"], user["role"])
 
@@ -112,8 +165,10 @@ def task_detail(task_id: str, user: dict = Depends(current_user)):
 @app.get("/tasks/{task_id}/draft")
 def task_draft(task_id: str, user: dict = Depends(current_user)):
     """读取当前患者的采集草稿；无草稿返回版本 0，越权返回 404，不调用模型。"""
+    # 获取采集草稿只读 task_drafts，未保存的草稿以版本 0 返回。
     try:
         return get_task_draft(user["user_id"], user["role"], task_id)
+    # 未获授权和编号不存在使用相同的响应，不能借编号猜测任务归属。
     except PermissionError as error:
         raise HTTPException(status_code=404, detail=str(error)) from error
 
@@ -127,12 +182,15 @@ def update_task_draft(task_id: str, data: SaveDraftData, user: dict = Depends(cu
     """
     risk = evaluate_risk(data=data.data.model_dump())  # 先纯计算，以便保存失败时仍可展示明确的风险。
     try:
+        # data.data 是字段模型，model_dump() 将其转换为草稿存储函数接受的字典。
         return save_task_draft(user["user_id"], user["role"], task_id,
                                data.expected_revision, data.data.model_dump())
     except PermissionError as error:
         raise HTTPException(status_code=404, detail=str(error)) from error
+    # 草稿版本或状态冲突时不覆盖他人在另一页面刚保存的值。
     except RuntimeError as error:
         return draft_error_response(409, str(error), risk)
+    # 输入类型正确也可能有业务冲突，例如“尚未测量”却填了读数。
     except ValueError as error:
         return draft_error_response(422, str(error), risk)
     except sqlite3.Error as error:
@@ -147,9 +205,11 @@ def draft_error_response(status_code, detail, risk):
     这不表示草稿保存成功，也不声称失败事务里的通知已经发出；无权访问不走此函数。
     """
     content = {"detail": detail}  # 保持既有页面和接口的错误字段。
+    # 失败时仅把已确定的高风险结果附在错误响应里，供页面单独显示。
     if risk["level"] == "high":
         content["risk"] = risk
         content["notification_saved"] = False  # 本次失败不能保证已保存通知，不能误导患者等待。
+    # status_code 保留 409、422 或 503，避免前端将提醒误当保存回执。
     return JSONResponse(status_code=status_code, content=content)
 
 
@@ -161,11 +221,14 @@ def submit_followup(task_id: str, data: SubmitDraftData, user: dict = Depends(cu
     身份来自登录凭证；不存在或越权为 404。数据库写入和事务放在 utils 中。
     """
     try:
+        # confirmed 必须为 True，expected_revision 必须匹配服务器所存草稿。
         return submit_task_draft(user["user_id"], user["role"], task_id, data.expected_revision, data.confirmed)
     except PermissionError as error:
         raise HTTPException(status_code=404, detail=str(error)) from error
+    # 已提交任务的不同版本不能再次提交，应刷新查看最新状态。
     except RuntimeError as error:
         raise HTTPException(status_code=409, detail=str(error)) from error
+    # 缺项或未勾选确认由存储层报告为 ValueError，页面会显示可修改的问题。
     except ValueError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
 
@@ -174,9 +237,30 @@ def submit_followup(task_id: str, data: SubmitDraftData, user: dict = Depends(cu
 def doctor_notifications(user: dict = Depends(current_user)):
     """返回当前负责医生收到的风险通知列表；只读，不实现通知处理或报告审核。"""
     try:
+        # SQL 同时检查接收人和任务当前负责医生，改派后旧医生无法读取。
         return list_doctor_notifications(user["user_id"], user["role"])
     except PermissionError as error:
         raise HTTPException(status_code=403, detail=str(error)) from error
+
+
+@app.get("/tasks/{task_id}/report")
+def task_report(task_id: str, user: dict = Depends(current_user)):
+    """读取本次报告视图。患者只能读到最终发布正文，医生可查看原始记录和引用。"""
+    return report_store.report_view(user, task_id)  # 同一个 URL，返回哪些字段由服务端决定。
+
+
+@app.post("/tasks/{task_id}/report/generate")
+def generate_report(task_id: str, data: report_store.GenerateRequest, user: dict = Depends(current_user)):
+    """接收 record_id，成功仅返回编号回执；模型或检索失败返回可重试的 503。"""
+    # 生成成功的回执只有 record_id，患者由此知道记录已受理。
+    return report_store.generate_report(user, task_id, data.record_id)
+
+
+@app.post("/tasks/{task_id}/report/review")
+def review_report(task_id: str, data: report_store.ReviewRequest, user: dict = Depends(current_user)):
+    """接收医生选择和所见版本，返回新版本；存储层在事务内核对归属、记录和状态。"""
+    # 例如 action=publish 要求该版本已经审核通过；页面不能自行将状态改为完成。
+    return report_store.review_report(user, task_id, data)
 
 
 @app.post("/chat")
@@ -189,6 +273,7 @@ def chat(data: ChatData, user: dict = Depends(current_user)):
     """
     # 已在页面进入任务也不能跳过检查，任务可能已被重新分配给其他医生。
     if data.task_id is not None:
+        # 在建立事件流之前验证任务，权限失效可以用 HTTP 404 明确告知页面。
         task = get_followup_task(user["user_id"], user["role"], data.task_id)
         # 在开始流式回答、创建 Agent 之前拒绝越权请求。
         if task is None:
@@ -204,4 +289,5 @@ def chat(data: ChatData, user: dict = Depends(current_user)):
             # 例如 {"type": "status", "content": "正在查询"} 后面加一个换行。
             yield json.dumps(event, ensure_ascii=False) + "\n"
 
+    # 告诉客户端按行读取 NDJSON；后续模型错误由流中的 error 事件表示。
     return StreamingResponse(events(), media_type="application/x-ndjson")
