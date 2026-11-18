@@ -97,7 +97,7 @@ def list_doctor_notifications(user_id, role):
         if account is None or account["role"] != "doctor":
             raise PermissionError("只有负责医生可以查看风险通知。")
         rows = conn.execute(
-            """SELECT n.id,n.task_id,p.name AS patient_name,n.message,n.created_at,n.read_at
+            """SELECT n.id,n.task_id,p.patient_id,p.name AS patient_name,n.message,n.created_at,n.read_at
                FROM notifications AS n
                JOIN followup_tasks AS t ON t.task_id=n.task_id
                JOIN doctors AS doctor ON doctor.doctor_id=t.doctor_id

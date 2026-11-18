@@ -7,6 +7,7 @@ from time import monotonic
 from utils.logger_handler import logger
 # 每次推理前读取已保存草稿，推理后按旧版本尝试合并。
 from utils.draft_store import get_task_draft, save_task_draft
+from utils import followup_store
 from utils.risk_rules import evaluate_risk
 # save_message_risk 在模型创建前可以独立提交通知。
 from utils.risk_store import save_message_risk
@@ -23,7 +24,7 @@ knowledge_lock = Lock()
 knowledge_ready = False
 
 
-def create_chat_agent(user_id, role, task_id=None):
+def create_chat_agent(user_id, role, task_id=None, patient_id=None, mode="query"):
     """创建与登录身份、当前任务绑定的 Agent。
 
     输入示例：user_id="U001"、role="patient"、task_id="F001"。
@@ -34,7 +35,7 @@ def create_chat_agent(user_id, role, task_id=None):
     # 到第一次聊天才加载模型。没有配置模型密钥，也可以先正常登录。
     from agent.tools.react_agent import ReactAgent
     ready_knowledge()  # 聊天和独立报告生成共用相同的向量库，加载失败可在下次重试。
-    return ReactAgent(user_id=user_id, role=role, task_id=task_id)
+    return ReactAgent(user_id=user_id, role=role, task_id=task_id, patient_id=patient_id, mode=mode)
 
 
 def ready_knowledge():
@@ -61,10 +62,10 @@ def forget_session(session_key):
         chat_sessions.pop(session_key, None)
 
 
-def stream_chat(session_key, user_id, role, message, task_id=None):
+def stream_chat(session_key, user_id, role, message, task_id=None, patient_id=None, mode="query"):
     """在已授权的任务范围内处理一条消息，逐个返回流式事件。
 
-    输入：会话哈希、服务端身份、消息文本，以及可选任务编号。
+    输入：会话哈希、服务端身份、消息、患者和任务范围。mode 为 query 或 collect。
     例如 task_id="F001"、message="这个任务什么时候到期？"。
     输出：依次产生 {"type": "status", "content": "..."} 等事件。
     同一任务保留多轮记忆；身份或任务改变时重建 Agent，避免混入旧任务信息。
@@ -73,20 +74,23 @@ def stream_chat(session_key, user_id, role, message, task_id=None):
     同会话并发、模型失败或版本冲突返回 error，不提交正式记录或改变任务状态。
     """
     # 风险检查不占用模型会话锁；上一条消息还在回答时，新危险信息仍应先提醒。
-    if role == "patient" and task_id is not None:
+    if role == "patient":
         risk = evaluate_risk(message=message)  # 不等模型提取、不等草稿完整，也不读旧草稿才能检查。
         # 只有命中升级规则才提前写通知，普通消息继续向下采集。
         if risk["level"] == "high":
-            try:
-                saved = save_message_risk(user_id, role, task_id, risk)  # 先独立提交通知，再流式发出提醒。
-            except Exception as error:
-                logger.error("风险通知保存失败，错误类型：%s", type(error).__name__)
-                # 通知未保存也发送提醒，前端可以直接向患者展示规则文案。
-                yield {"type": "risk", "content": {"risk": risk, "notification_saved": False}}
-                yield {"type": "error", "content": "风险提醒已显示，但医生通知未能保存。请直接联系医生或及时就医，不要等待助手回复。"}
-                return  # 未取得会话锁，不能重置或解锁另一条正在处理的消息。
-            # saved 表示通知已持久可见；这与医生是否已经查看是两回事。
-            yield {"type": "risk", "content": {"risk": risk, "notification_saved": saved}}
+            if task_id is None:
+                # 首页不自动挑选一次历史随访发通知，立即给出可见的规则提示。
+                yield {"type": "risk", "content": {"risk": risk, "notification_saved": False,
+                                                    "notification_reason": "no_task"}}
+            else:
+                try:
+                    saved = save_message_risk(user_id, role, task_id, risk)
+                except Exception as error:
+                    logger.error("风险通知保存失败，错误类型：%s", type(error).__name__)
+                    yield {"type": "risk", "content": {"risk": risk, "notification_saved": False}}
+                    yield {"type": "error", "content": "医生通知未能保存。请直接联系医生或及时就医，不要等待助手回复。"}
+                    return
+                yield {"type": "risk", "content": {"risk": risk, "notification_saved": saved}}
 
     # monotonic() 是只向前走的计时值，用于清理一天没有使用的内存会话。
     now = monotonic()
@@ -100,7 +104,7 @@ def stream_chat(session_key, user_id, role, message, task_id=None):
         if session_key not in chat_sessions:
             # 新 token 首次聊天只建一个空槽位，等拿到本会话锁才初始化模型。
             chat_sessions[session_key] = {
-                "agent": None, "task_id": None, "lock": Lock(), "last_used": now,
+                "agent": None, "scope": None, "lock": Lock(), "last_used": now,
             }
         # 从此处起 session 是本次登录专属的字典，与其他账号的 Agent 独立。
         session = chat_sessions[session_key]
@@ -114,24 +118,32 @@ def stream_chat(session_key, user_id, role, message, task_id=None):
     try:
         # 草稿按任务保存，不依赖聊天记忆；换登录或重启后仍读取同一份业务数据。
         draft = None
-        if role == "patient" and task_id is not None:
+        if mode == "collect":
+            if role != "patient" or task_id is None:
+                yield {"type": "error", "content": "请先进入自己的随访任务。"}
+                return
             # 例如 {"revision":2,"editable":true,"data":{…}}，里面的版本用于末尾保存。
             draft = get_task_draft(user_id, role, task_id)
-        # 如果身份或任务范围发生变化，丢弃旧 Agent，重新建立独立的任务记忆。
-        # agent 可能为 None，例如上一轮模型异常后需要重新创建。
-        agent = session["agent"]
-        if agent is not None:
-            # 普通 if 分开检查，便于看清三种需要重建 Agent 的原因。
-            if agent.user_id != user_id or agent.role != role:
-                session["agent"] = None  # 登录身份变了，旧权限不能继续使用。
-            if session["task_id"] != task_id:
-                session["agent"] = None  # 切换任务或回到通用聊天，不沿用另一范围的记忆。
-        session["task_id"] = task_id  # 锁内记录范围；同会话不能同时处理两项任务。
+            if not draft["editable"]:
+                yield {"type": "error", "content": "这次随访已提交，请使用「问助手」继续查询。"}
+                return
+        # 同一医生在同一档案中也可能失去某次任务权限。授权范围变化时清掉旧模型记忆。
+        # 保存稳定编号而非病历正文，普通状态变化不打断正在追问的对话。
+        access = []
+        if task_id is None:
+            for person in followup_store.list_patients(user_id, role, patient_id=patient_id):
+                access.append(("patient", person["patient_id"], person["is_primary"]))
+            for task in followup_store.list_followup_tasks(user_id, role, patient_id=patient_id):
+                access.append(("task", task["task_id"], task["patient_id"], task["discharge_id"]))
+        scope = (user_id, role, patient_id, task_id, mode, sorted(access))
+        if session.get("scope") != scope:
+            session["agent"] = None
+            session["scope"] = scope
         if session["agent"] is None:
             # 提前显示准备状态，让用户看到首次加载知识库的等待原因。
             yield {"type": "status", "content": "正在准备 Agent 和医学知识库……"}
             # 同时传入身份与任务范围，后续工具查询由这些服务端值限定。
-            session["agent"] = create_chat_agent(user_id, role, task_id=task_id)
+            session["agent"] = create_chat_agent(user_id, role, task_id=task_id, patient_id=patient_id, mode=mode)
 
         # 普通查询沿用原签名；患者任务把最新草稿传入每一轮推理。
         if draft is None:

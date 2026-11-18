@@ -10,15 +10,32 @@ from agent.tools.draft_collection import propose_draft_changes
 from rag.rag_service import RagService
 # 三种医疗查询共用数据库授权逻辑，传给模型的结果已经过筛选。
 from utils.followup_store import (
+    list_patients,
     list_followup_tasks,
     list_discharges,
     list_recent_records,
 )
+from utils.report_store import report_view
 
 
 # rag 是知识库服务对象：vector_store 管理向量库，rag_search() 检索参考资料。
 # 医疗记录走 SQLite 查询，公共医学问题走 RAG，两类来源分别处理。
 rag = RagService()
+
+
+@tool(description="查询当前授权范围内的患者基本资料、主管医生与随访关联；可用于回答我的医生是谁或我负责哪些患者")
+def get_related_people(runtime: ToolRuntime) -> list[dict]:
+    """读取服务端选定范围内的医患资料；无档案时返回 []。只读，不接受姓名作授权参数。"""
+    context = runtime.context
+    return list_patients(context["user_id"], context["role"],
+                         patient_id=context.get("patient_id"), task_id=context.get("task_id"))
+
+
+@tool(description="查询页面当前这一次随访的报告进度、负责医生、审核信息以及当前角色可阅读的正文")
+def get_current_report(runtime: ToolRuntime) -> dict:
+    """输入服务端任务上下文，返回与页面相同的报告视图。只读，越权时由存储层拒绝。"""
+    context = runtime.context
+    return report_view(context, context["task_id"])
 
 
 @tool(description="查询当前患者自己的随访任务；医生查询分配给自己的任务；已进入任务时仅返回当前任务")
@@ -36,6 +53,7 @@ def get_my_followup_tasks(runtime: ToolRuntime) -> list[dict]:
         # patient 与 doctor 会在同一查询中匹配不同的归属条件。
         role=runtime.context["role"],
         task_id=runtime.context.get("task_id"),  # 未进入任务时为 None，保留原查询方式。
+        patient_id=runtime.context.get("patient_id"),  # 医生打开某人的档案后仅查询该患者。
     )
 
 
@@ -53,6 +71,7 @@ def get_my_discharges(runtime: ToolRuntime) -> list[dict]:
         # 结合下一行的任务编号，只查看本次任务所属的出院记录。
         role=runtime.context["role"],
         task_id=runtime.context.get("task_id"),  # 由服务器限定关联的出院记录。
+        patient_id=runtime.context.get("patient_id"),
     )
 
 
@@ -70,6 +89,7 @@ def get_my_recent_records(runtime: ToolRuntime) -> list[dict]:
         # 医生读取的是分配给自己的任务记录，患者读取自己的记录。
         role=runtime.context["role"],
         task_id=runtime.context.get("task_id"),  # 限定当前任务，不能把其他任务的记录混进来。
+        patient_id=runtime.context.get("patient_id"),
     )
 
 

@@ -5,9 +5,11 @@ import hashlib
 import json
 # 捕获 SQLite 的表、连接或事务异常，统一转成前端可处理的 HTTP 状态。
 import sqlite3
+from contextlib import asynccontextmanager
+from typing import Literal
 
 # Depends 会在路由执行前调用鉴权函数，HTTPException 会提前结束本次请求。
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException
 # 普通失败用 JSONResponse；聊天用 StreamingResponse 连续发送多行。
 from fastapi.responses import JSONResponse, StreamingResponse
 # HTTPBearer 读取 Authorization 请求头，例如 Bearer 后跟登录得到的随机串。
@@ -18,7 +20,7 @@ from pydantic import BaseModel, ConfigDict, Field
 # stream_chat 返回事件生成器；forget_session 清理当前 token 对应的内存记忆。
 from agent.tools.chat_session import forget_session, stream_chat
 # 账号查询和令牌撤销集中在 user_store，页面无需了解密码存储格式。
-from utils import user_store
+from utils import followup_store, user_store
 from utils import report_store  # 独立处理报告的授权查询、版本检查和事务。
 # 工具查询和 HTTP 查询复用相同的任务权限条件。
 from utils.followup_store import get_followup_task, list_followup_tasks
@@ -32,8 +34,15 @@ from utils.risk_store import list_doctor_notifications
 from utils.risk_rules import evaluate_risk
 from utils.logger_handler import logger
 
-# FastAPI 启动时收集下方的路由，函数名无需与浏览器路径相同。
-app = FastAPI(title="高血压随访助手")
+@asynccontextmanager
+async def lifespan(application):
+    """FastAPI 启动时检查已有登录表列，缺库或列不匹配则报错；不建库、不加载模型。"""
+    user_store.init_db()
+    yield  # 检查通过才开始接收 HTTP 请求。
+
+
+# FastAPI 启动时收集下方路由并运行一次表结构检查。
+app = FastAPI(title="高血压随访助手", lifespan=lifespan)
 # 缺少凭证时交给 current_user 返回统一的 401 提示。
 bearer = HTTPBearer(auto_error=False)
 
@@ -46,14 +55,18 @@ async def report_error(request, error):
 
 
 
-class LoginData(BaseModel):
-    # 这里只接收用户名和密码，不能通过请求指定 doctor 等角色。
-    # 例如登录请求里额外传入 role 会得到 422，不能伪造医生身份。
+class AccountData(BaseModel):
+    """姓名及密码请求。注册接口禁止指定角色，已有客户端继续使用 username 传姓名。"""
     model_config = ConfigDict(extra="forbid")
     # 长度检查通过后，注册入口还会排除全空格用户名。
     username: str = Field(min_length=1, max_length=64)
     # 密码只作为本次校验输入，成功响应不返回这个字段。
     password: str = Field(min_length=1, max_length=128)
+
+
+class LoginData(AccountData):
+    """登录时可附加页面入口，实际角色取自账号。旧客户端可省略入口。"""
+    role: Literal["patient", "doctor"] | None = None
 
 
 class ChatData(BaseModel):
@@ -63,6 +76,9 @@ class ChatData(BaseModel):
     message: str = Field(min_length=1, max_length=4000)
     # 不传 task_id 或传 null 表示普通聊天；传任务编号时，后端还要检查任务归属。
     task_id: str | None = Field(default=None, min_length=1, max_length=64)
+    # 档案页选中的患者还须在服务端核实；查询为默认，只有主动采集才提供草稿工具。
+    patient_id: str | None = Field(default=None, min_length=1, max_length=64)
+    mode: Literal["query", "collect"] = "query"
 
 
 def current_user(credentials: HTTPAuthorizationCredentials = Depends(bearer)):
@@ -94,7 +110,7 @@ async def database_error(request, error):
 
 # POST /auth/register 成功时返回 201，表示新建了患者登录账号。
 @app.post("/auth/register", status_code=201)
-def register(data: LoginData):
+def register(data: AccountData):
     """接收用户名和密码，写入一个患者账号并返回提示；空用户名 422，重名 409。"""
     # 患者自主注册；医生使用医疗库中已经分配好角色的账号。
     if not data.username.strip():
@@ -111,10 +127,10 @@ def register(data: LoginData):
 def login(data: LoginData):
     """核对账号密码，记录新会话并返回令牌及身份；登录失败返回 401。"""
     # 存储层校验密码并插入一条有过期时间的登录会话。
-    result = user_store.login_user(data.username, data.password)
+    result = user_store.login_user(data.username, data.password, data.role)
     # 统一登录失败提示，避免通过响应区分哪个用户名存在。
     if result is None:
-        raise HTTPException(status_code=401, detail="用户名或密码错误，或账号未开通医患访问权限。")
+        raise HTTPException(status_code=401, detail="请核对姓名、密码和选择的登录身份。")
     # 成功形状示例 {"access_token":"…","user":{"user_id":"U1","role":"patient",…}}。
     return result
 
@@ -136,6 +152,21 @@ def logout(user: dict = Depends(current_user), credentials: HTTPAuthorizationCre
     # 使用令牌摘要定位这次登录的 Agent，不影响同账号的其他设备。
     forget_session(user["session_key"])
     return {"message": "已退出登录。"}
+
+
+@app.get("/patients")
+def patients(user: dict = Depends(current_user)):
+    """按登录身份返回名册；患者只见自己，无档案时为空列表。仅查询数据库。"""
+    return followup_store.list_patients(user["user_id"], user["role"])
+
+
+@app.get("/patients/{patient_id}")
+def patient_detail(patient_id: str, user: dict = Depends(current_user)):
+    """按患者编号读取授权档案、出院和随访；无关联与不存在均返回 404。"""
+    detail = followup_store.get_patient_detail(user["user_id"], user["role"], patient_id)
+    if detail is None:
+        raise HTTPException(status_code=404, detail="患者不存在或无权访问。")
+    return detail
 
 
 # GET /tasks 没有身份参数，即使医生查任务也只用服务器确认的身份。
@@ -214,15 +245,16 @@ def draft_error_response(status_code, detail, risk):
 
 
 @app.post("/tasks/{task_id}/submit")
-def submit_followup(task_id: str, data: SubmitDraftData, user: dict = Depends(current_user)):
-    """患者明确确认后提交已保存草稿；返回记录编号与风险结果，不调用 Agent。
+def submit_followup(task_id: str, data: SubmitDraftData, background_tasks: BackgroundTasks,
+                    user: dict = Depends(current_user)):
+    """患者确认后写正式记录，先回传成功，再在后台按记录编号生成报告。
 
     输入例：{expected_revision: 2, confirmed: true}。缺项为 422，版本/状态冲突为 409。
     身份来自登录凭证；不存在或越权为 404。数据库写入和事务放在 utils 中。
     """
     try:
         # confirmed 必须为 True，expected_revision 必须匹配服务器所存草稿。
-        return submit_task_draft(user["user_id"], user["role"], task_id, data.expected_revision, data.confirmed)
+        result = submit_task_draft(user["user_id"], user["role"], task_id, data.expected_revision, data.confirmed)
     except PermissionError as error:
         raise HTTPException(status_code=404, detail=str(error)) from error
     # 已提交任务的不同版本不能再次提交，应刷新查看最新状态。
@@ -231,6 +263,20 @@ def submit_followup(task_id: str, data: SubmitDraftData, user: dict = Depends(cu
     # 缺项或未勾选确认由存储层报告为 ValueError，页面会显示可修改的问题。
     except ValueError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
+    # 重复点击只取原回执；生成失败的任务仍可由负责医生从待办中重试。
+    if not result["already_submitted"]:
+        identity = {"user_id": user["user_id"], "role": user["role"]}
+        background_tasks.add_task(generate_submitted_report, identity, task_id, result["record_id"])
+    return result
+
+
+def generate_submitted_report(user, task_id, record_id):
+    """在 HTTP 回执发出后生成报告。读已提交记录、请求模型并写报告；失败保留待办。"""
+    try:
+        report_store.generate_report(user, task_id, record_id)
+    except Exception as error:
+        # 此时患者的提交事务已完成，医生可重试。日志记录错误类型，不带病历正文。
+        logger.warning("后台生成随访报告未完成，错误类型：%s", type(error).__name__)
 
 
 @app.get("/notifications")
@@ -272,19 +318,30 @@ def chat(data: ChatData, user: dict = Depends(current_user)):
     聊天不能修改任务状态或提交正式随访记录。
     """
     # 已在页面进入任务也不能跳过检查，任务可能已被重新分配给其他医生。
+    patient_id = data.patient_id  # 可能在档案页选定，也可能由被授权的任务补全。
     if data.task_id is not None:
         # 在建立事件流之前验证任务，权限失效可以用 HTTP 404 明确告知页面。
         task = get_followup_task(user["user_id"], user["role"], data.task_id)
         # 在开始流式回答、创建 Agent 之前拒绝越权请求。
         if task is None:
             raise HTTPException(status_code=404, detail="任务不存在或无权访问。")
+        if data.patient_id is not None and task["patient_id"] != data.patient_id:
+            raise HTTPException(status_code=404, detail="任务不存在或无权访问。")
+        # 即使页面只传任务号，各工具也绑定这次实际查到的患者，改派后不会沿用旧患者记忆。
+        patient_id = task["patient_id"]
+    elif data.patient_id is not None:
+        # 档案页没有选单次任务时，也必须验证患者关系。
+        if not followup_store.list_patients(user["user_id"], user["role"], patient_id=data.patient_id):
+            raise HTTPException(status_code=404, detail="患者不存在或无权访问。")
+    if data.mode == "collect" and (user["role"] != "patient" or data.task_id is None):
+        raise HTTPException(status_code=422, detail="采集模式需要先进入自己的随访任务。")
 
     def events():
         """把事件转为逐行 JSON；草稿校验保存由会话层调用 utils 完成。"""
         # 一行一个 JSON 事件，前端收到一行便可更新工具状态或回答。
         for event in stream_chat(
             user["session_key"], user["user_id"], user["role"], data.message,
-            task_id=data.task_id,
+            task_id=data.task_id, patient_id=patient_id, mode=data.mode,
         ):
             # 例如 {"type": "status", "content": "正在查询"} 后面加一个换行。
             yield json.dumps(event, ensure_ascii=False) + "\n"

@@ -8,6 +8,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from agent.tools.report_generation import build_report
+from utils.followup_store import doctor_card, report_assignment
 from utils.logger_handler import logger
 from utils.user_store import get_connection
 
@@ -54,10 +55,13 @@ def current_case(conn, user, task_id):
     """
     # LEFT JOIN 让尚未生成报告的任务也能返回；ORDER BY 优先选择正式记录版本最大的那次。
     row = conn.execute("""
-        SELECT t.task_status, t.doctor_id, r.record_id, r.revision, r.submitted_at,
+        SELECT t.task_status, t.doctor_id, d.name AS doctor_name, d.department AS doctor_department,
+               d.title AS doctor_title, r.record_id, r.revision, r.submitted_at,
                r.systolic_bp, r.diastolic_bp, r.bp_measurement_status, r.heart_rate, r.symptoms,
                r.medication_adherence, r.risk_level, r.risk_reason, r.data_json,
-               b.report_id, b.status, b.version, b.content_json, b.review_note
+               b.report_id, b.status, b.version, b.content_json, b.review_note, b.reviewed_at,
+               reviewer.doctor_id AS reviewer_id, reviewer.name AS reviewer_name,
+               reviewer.department AS reviewer_department, reviewer.title AS reviewer_title
         FROM followup_tasks t
         JOIN doctors d ON d.doctor_id=t.doctor_id
         JOIN discharges h ON h.discharge_id=t.discharge_id
@@ -67,9 +71,11 @@ def current_case(conn, user, task_id):
             SELECT record_id FROM followup_records WHERE task_id=t.task_id
             ORDER BY revision DESC, submitted_at DESC, record_id DESC LIMIT 1)
         LEFT JOIN reports b ON b.record_id=r.record_id AND b.task_id=t.task_id
-        WHERE t.task_id=? AND ((u.role='patient' AND p.user_id=u.user_id)
+        LEFT JOIN doctors reviewer ON reviewer.doctor_id=b.reviewer_id
+        WHERE t.task_id=? AND (? IS NULL OR p.patient_id=?)
+          AND ((u.role='patient' AND p.user_id=u.user_id)
                            OR (u.role='doctor' AND d.user_id=u.user_id))
-        """, (user["user_id"], user["role"], task_id)).fetchone()
+        """, (user["user_id"], user["role"], task_id, user.get("patient_id"), user.get("patient_id"))).fetchone()
     # 即使请求指定正确的 task_id，角色或任务归属不匹配也读不到任何行。
     if row is None:
         raise ReportError(404, "任务不存在或无权访问。")
@@ -92,11 +98,18 @@ def original_record(row):
 
 
 def report_view(user, task_id):
-    """返回当前登录者的报告视图字典。只读；患者在发布前最多能看到退回意见。"""
+    """输入身份和任务编号，只读报告进度、当次医生与可见正文；越权抛 404。
+
+    新报告的医生名片从快照读取，旧报告的审核人由既有 reviewer_id 核实。
+    患者在发布前只能看到任务进度、负责医生及需要补充的意见。
+    """
     with closing(get_connection()) as conn:
         row = current_case(conn, user, task_id)
     # 先构造可以给患者的最小响应，按角色逐个添加经过授权的字段。
-    view = {"task_status": row["task_status"], "record_id": row["record_id"]}
+    assigned = doctor_card(row, "doctor")  # 尚无正式报告时，展示实时任务分配。
+    view = {"task_status": row["task_status"], "record_id": row["record_id"],
+            "responsible_doctor": assigned, "responsible_doctor_source": "current_task",
+            "reviewer": None, "reviewed_at": None}
     if user["role"] == "doctor":
         view["record"] = original_record(row)  # 只有负责医生能在审核页面对照原始数据。
         view["report_id"] = row["report_id"]
@@ -106,7 +119,18 @@ def report_view(user, task_id):
     # 报告和任务的终态都必须满足才向患者开放正文。
     published = row["status"] == "published" and row["task_status"] == "completed"
     if row["report_id"] and (user["role"] == "doctor" or published):
-        view["content"] = json.loads(row["content_json"])  # 从持久快照恢复，知识库改版也能查看。
+        content = json.loads(row["content_json"])  # 保留发布时的引用和原文，名片单列给界面。
+        snapshot = content.pop("_responsible_doctor", None)
+        reviewer = content.pop("_reviewer", None)
+        if reviewer is None:
+            reviewer = doctor_card(row, "reviewer")  # 老报告有审核编号时可核实医生身份。
+        # 与历史报告列表共用同一判定：无快照时说明来源，记录有冲突时保留独立审核人。
+        responsible, source = report_assignment(row, snapshot, row["reviewer_id"])
+        view["responsible_doctor"] = responsible
+        view["responsible_doctor_source"] = source
+        view["reviewer"] = reviewer
+        view["reviewed_at"] = row["reviewed_at"]
+        view["content"] = content
         view["note"] = row["review_note"]
     elif row["status"] == "returned" and row["task_status"] == "needs_info":
         view["note"] = row["review_note"]  # 患者需要这段文字来补充资料，不返回报告正文。
@@ -158,6 +182,9 @@ def generate_report(user, task_id, record_id):
         if not generation_needed(row, record_id):
             return receipt
         report_id = "RP_" + record_id  # reports.record_id 另有数据库唯一约束。
+        # 生成时使用事务里重新核实的任务医生名片；以后的改派或职称变更不会覆盖当次信息。
+        content = dict(content)
+        content["_responsible_doctor"] = doctor_card(row, "doctor")
         conn.execute("""INSERT INTO reports(report_id,record_id,task_id,content_json,status,generation_mode,created_at)
                         VALUES(?,?,?,?,'pending_review','rag',CURRENT_TIMESTAMP)""",
                      (report_id, record_id, task_id, json.dumps(content, ensure_ascii=False)))
@@ -247,7 +274,12 @@ def review_report(user, task_id, request):
                 # 如果没改任何业务字段，提示直接通过，审计中的操作名才真实。
                 if content == original:
                     raise ReportError(422, "报告尚未修改，可选择直接通过。")
-                details["original_content"] = original  # 审计中保留完整原稿及其引用，即使此次删除了建议。
+                # 名片单独保存，修改审计的 original_content 只记录医生核对的业务正文。
+                original.pop("_responsible_doctor", None)
+                original.pop("_reviewer", None)
+                details["original_content"] = original  # 即使此次删除建议，也能还原带引用的原稿。
+            # 审核动作只能由事务核实过的当前任务医生执行，审核人可能不同于生成时负责人。
+            content["_reviewer"] = doctor_card(row, "doctor")
             conn.execute("""UPDATE reports SET content_json=?, status=?, reviewer_id=?,
                             reviewed_at=CURRENT_TIMESTAMP, review_note=?, version=version+1 WHERE report_id=?""",
                          (json.dumps(content, ensure_ascii=False), status, row["doctor_id"],

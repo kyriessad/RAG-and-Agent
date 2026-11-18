@@ -89,7 +89,7 @@ def init_db():
     conn = get_connection()
     try:
         # LIMIT 0 不读取账号内容，只确认登录所需的表和列确实存在。
-        conn.execute("SELECT user_id, username, password_hash, role FROM users LIMIT 0")
+        conn.execute("SELECT user_id, name, password_hash, role FROM users LIMIT 0")
         # 同样核对登录令牌表，注册、登录和鉴权都连接这一库。
         conn.execute("SELECT token_hash, user_id, expires_at FROM sessions LIMIT 0")
     finally:
@@ -113,7 +113,7 @@ def register_user(username: str, password: str) -> bool:
         # 注册页不能选择医生角色；医生账号由已有医疗账号体系提供。
         # 这里只创建登录账号，不自动编造患者姓名、年龄或病历。
         conn.execute(
-            "INSERT INTO users (user_id, username, password_hash, role) VALUES (?, ?, ?, 'patient')",
+            "INSERT INTO users (user_id, name, password_hash, role) VALUES (?, ?, ?, 'patient')",
             # 问号按顺序绑定这三个值，用户名里的引号也只是普通输入。
             (user_id, username, password_hash),
         )
@@ -133,19 +133,22 @@ def register_user(username: str, password: str) -> bool:
         conn.close()
 
 
-def login_user(username: str, password: str) -> dict | None:
-    """登录成功返回 token 和用户信息；账号、密码或角色不符合时返回 None。"""
+def login_user(username: str, password: str, role: str | None = None) -> dict | None:
+    """按姓名和密码登录，若指定入口则同时核对角色。成功时写会话并返回凭证，失败返回 None。"""
     conn = get_connection()
     try:
         # fetchone() 取一行或 None；不会把 users 全表放进内存。
         row = conn.execute(
-            "SELECT user_id, username, password_hash, role FROM users WHERE username = ?",
+            "SELECT user_id, name AS username, password_hash, role FROM users WHERE name = ?",
             # 单个 SQL 参数也需要写成元组，末尾逗号有实际作用。
             (username.strip(),),
         ).fetchone()
 
         # 角色直接读取数据库，不相信页面传来的角色名称。
         if row is None or row["role"] not in ("patient", "doctor"):
+            return None
+        # 入口只用来核对已有身份，角色不匹配时不签发登录凭证。
+        if role is not None and row["role"] != role:
             return None
         # 用数据库中的算法、盐和迭代数验证用户刚提交的密码。
         if not verify_password(password, row["password_hash"]):
@@ -186,7 +189,7 @@ def get_current_user(token: str) -> dict | None:
         # 每次请求重新关联 users，用户角色以数据库中的当前值为准。
         row = conn.execute(
             """
-            SELECT u.user_id, u.username, u.role, s.expires_at
+            SELECT u.user_id, u.name AS username, u.role, s.expires_at
             FROM sessions AS s
             JOIN users AS u ON u.user_id = s.user_id
             WHERE s.token_hash = ?

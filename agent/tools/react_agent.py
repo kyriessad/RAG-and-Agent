@@ -11,6 +11,7 @@ from utils.prompt_loader import load_system_prompts
 from agent.tools.agent_tools import (
     rag_search, get_my_followup_tasks, get_my_discharges,
     get_my_recent_records, fill_context_for_report, propose_followup_draft,
+    get_related_people, get_current_report,
 )
 # 中间件分别观测工具调用、记录模型执行和补充当前任务提示。
 from agent.tools.middle_ware import monitor_tool, log_before_model, report_prompt_switch
@@ -21,7 +22,8 @@ from langchain.agents.middleware import ToolCallLimitMiddleware
 
 
 class ReactAgent:
-    def __init__(self, user_id: str, role: str, task_id: str | None = None):
+    def __init__(self, user_id: str, role: str, task_id: str | None = None,
+                 patient_id: str | None = None, mode: str = "query"):
         """创建当前身份和任务的 Agent；不提交任何业务记录。
 
         输入示例：user_id="U001"、role="patient"、task_id="F001"。
@@ -34,17 +36,20 @@ class ReactAgent:
         self.user_id = str(user_id)  # 是这个用户在用 agent
         self.role = role  # 字符串：patient 表示患者，doctor 表示医生。
         self.task_id = task_id  # str 或 None：由后端校验归属的任务编号，不从聊天文字提取。
+        self.patient_id = patient_id  # 档案范围由 HTTP 接口核对，工具使用同一组条件。
 
         # 身份由后端查登录凭证得到，模型只能选择查询工具，不能指定其他用户。
         medical_tools = [
             rag_search, get_my_followup_tasks, get_my_discharges,
-            get_my_recent_records,
+            get_my_recent_records, get_related_people,
         ]
+        if task_id is not None:
+            medical_tools.append(get_current_report)  # 复用该角色在报告页能看到的内容。
         # 报告文字整理只提供给医生；患者采集提议只在指定任务时开放。
         if role == "doctor":
             # 医生可让聊天助手整理文字；保存正式报告由专用 HTTP 接口处理。
             medical_tools.append(fill_context_for_report)
-        if role == "patient" and task_id is not None:
+        if role == "patient" and task_id is not None and mode == "collect":
             medical_tools.append(propose_followup_draft)  # 只在患者任务中开放采集提议。
 
         # 创建一次，后续同一登录和同一任务复用它的内存检查点。
@@ -86,6 +91,8 @@ class ReactAgent:
             "get_my_followup_tasks": "查询随访任务",
             "get_my_discharges": "查询出院信息",
             "get_my_recent_records": "查询近期血压记录",
+            "get_related_people": "查询医患资料",
+            "get_current_report": "读取本次随访进度和报告",
             "fill_context_for_report": "整理报告草稿",
             "rag_search": "检索高血压知识库",
             "propose_followup_draft": "整理本次随访信息",
@@ -97,7 +104,8 @@ class ReactAgent:
         final_answer = ""
         # 本轮共用这个字典；工具将提议写在内存中，身份和原话均由服务端提供。
         context = {"report": False, "user_id": self.user_id, "role": self.role,
-                   "task_id": self.task_id, "draft": draft, "patient_message": query,
+                   "task_id": self.task_id, "patient_id": self.patient_id,
+                   "draft": draft, "patient_message": query,
                    "draft_lock": Lock()}
 
         # yield 先发一条状态，然后继续运行，前端无需等整个函数返回。

@@ -16,7 +16,7 @@
 #   页面输入账号密码
 #     → request_api("POST", "/auth/login", data={...})
 #     → backend.py 的 login(data)
-#     → utils/user_store.py 的 login_user(username, password)
+#     → utils/user_store.py 核对姓名、密码和选定角色
 #     → get_connection() 打开 DB_PATH 指向的 data/medical.db。
 #   后端返回登录凭证和账号信息 → 页面保存到 st.session_state → 重跑显示聊天页。
 # medical.db 不仅用于登录：注册写 users，登录写 sessions，鉴权查 sessions/users，
@@ -29,7 +29,8 @@
 #   工具结果交给模型整理 → 后端逐行返回 JSON 事件 → 本文件更新状态/回答。
 #   注意：这里不是根据关键词直接选择工具，选择动作在后端 Agent 中完成。
 #   患者先通过 GET /tasks 查看任务，再通过 GET /tasks/{task_id} 进入指定任务。
-#   患者聊天会附带 task_id；后端重新检查归属，再把任务范围交给 Agent。
+#   首页查询只传 mode=query；打开患者或任务后可按相应范围查询。
+#   进入可编辑随访才启用 mode=collect，并携带 task_id，后端重新检查归属。
 #   页面选择任务不会改变任务状态，也不会提交任何随访记录。
 #
 # ==================== 向量库什么时候同步 ====================
@@ -171,8 +172,12 @@ def show_risk_notice(content):
         for reason in risk.get("reasons", []):
             st.write("触发原因：" + reason)  # 保留可解释的规则依据，不展示推理过程。
         # 明确的 False 表示这次写库失败；未传这个标记时不能推断通知投递结果。
-        if content.get("notification_saved") is False:
+        if content.get("notification_reason") == "no_task":
+            st.warning("当前没有关联随访任务，本次未发送医生站内提醒。请直接联系医生。")
+        elif content.get("notification_saved") is False:
             st.warning("医生站内提醒尚未保存成功，请直接联系医生；不要等待助手回答。")
+        elif content.get("notification_saved") is True:
+            st.caption("负责医生的站内提醒已保存。")
 
 
 def show_cached_task_risk(task_id):
@@ -254,7 +259,7 @@ def show_patient_submit(token, task_id, latest, base):
     confirmed = st.checkbox("我已核对上面的信息，确认提交本次随访", key="draft_confirm",
                             disabled=not can_submit)  # 默认不勾选，不代替患者确认。
     # 只有患者主动勾选并点击按钮才发出 POST；普通页面重跑不会提交。
-    if st.button("确认提交随访", key="draft_submit", disabled=not can_submit or not confirmed):
+    if st.button("确认提交随访", key="draft_submit", type="primary", disabled=not can_submit or not confirmed):
         try:
             result = request_api("POST", f"/tasks/{task_id}/submit", token=token, data={
                 "expected_revision": base["revision"], "confirmed": True,
@@ -267,47 +272,8 @@ def show_patient_submit(token, task_id, latest, base):
         else:
             st.session_state["draft_submit_notice"] = result  # 下一轮展示成功并读取实时状态。
             st.session_state["draft_reload"] = True
-            # 已提交的记录是报告的唯一业务输入，等待模型期间向患者显示当前进度。
-            with st.spinner("记录已保存，正在根据本次记录和知识库整理报告……"):
-                try:
-                    # 两次 POST 分开：报告模型失败时，前一个事务中的正式记录依旧有效。
-                    request_api("POST", f"/tasks/{task_id}/report/generate", token=token,
-                                data={"record_id": result["record_id"]})
-                except requests.RequestException as error:
-                    # 网络断开也可能已生成。重跑先 GET 实际状态，再决定是否展示重试按钮。
-                    if error.response is not None and error.response.status_code == 401:
-                        clear_login()
-                    else:
-                        # 暂存提示到下一轮；页面重新获取任务状态后能区分已生成与待重试。
-                        st.session_state["draft_generation_interrupted"] = True
-            st.rerun()  # 成功后去看审核进度；失败时只重试生成，不重复确认随访。
-
-
-def show_doctor_notifications(token):
-    """通过 GET /notifications 展示当前医生的风险通知，返回 None；不审核或修改通知。
-
-    列表由后端按负责医生授权；例如 [{task_id: F001, patient_name: 张某, message: ...}]。
-    请求失败只展示错误和刷新按钮，不能使用其他账号的旧通知。
-    """
-    st.subheader("风险通知")
-    if st.button("刷新风险通知", key="reload_notifications"):
-        st.rerun()  # 重新请求服务端，不在页面缓存通知列表。
-    try:
-        # 响应是列表，顺序由后端按通知时间确定；每轮都用当前医生凭证读取。
-        notifications = request_api("GET", "/notifications", token=token).json()
-    except requests.RequestException as error:
-        show_request_error(error)
-        return  # 通知加载失败不假装没有通知。
-    # 成功返回空列表说明这位医生目前没有站内风险通知。
-    if not notifications:
-        st.info("当前没有风险通知。")
-    for notification in notifications:
-        st.write("患者：", notification.get("patient_name", "未提供"))
-        st.write("随访任务：", notification["task_id"])
-        st.warning(notification["message"])  # 保留通知原文，不由页面生成医学意见。
-        # 这里展示的是通知产生时间，和患者描述的测量时间可以不同。
-        st.caption("通知时间：" + notification["created_at"])
-        st.divider()
+            # 接口已接收正式记录，下一轮读取实际处理进度，不让患者再次触发模型。
+            st.rerun()
 
 
 def display_report(content):
@@ -343,8 +309,8 @@ def show_report_workflow(token, task_id, doctor=False):
             st.rerun()
         # 记录已提交而任务仍在 submitted，说明草稿生成尚未完成。
         if view["task_status"] == "submitted":
-            st.info("随访记录已保存，报告草稿待生成。")
-            if st.button("重新生成报告草稿", key="generate_report"):
+            st.info("随访记录已保存，正在等待整理报告。")
+            if doctor and st.button("生成报告草稿", key="generate_report"):
                 with st.spinner("正在检索资料并生成报告……"):
                     # 只发送当前正式记录编号，即使重试多次也不能创建第二条随访记录。
                     request_api("POST", path + "/generate", token=token, data={"record_id": view["record_id"]})
@@ -353,21 +319,37 @@ def show_report_workflow(token, task_id, doctor=False):
         if not doctor:
             if view.get("note"):
                 st.write("医生意见", view["note"])  # 退回只显示补充要求；已发布可查看最终审核意见。
+            elif view["task_status"] == "needs_info":
+                st.info("医生请你补充本次随访信息，当前没有可查看的具体意见。")
             # 仅在接口确实返回 content 时显示正文。发布前患者响应里没有这个字段。
             if "content" in view:
                 st.subheader("我的最终随访报告")
+                st.write("本次负责医生", report_doctor_label(view.get("responsible_doctor"),
+                                                        view.get("responsible_doctor_source")))
+                if view.get("reviewer"):
+                    st.caption("审核医生 · " + doctor_label(view["reviewer"]))
+                if view.get("reviewed_at"):
+                    st.caption("审核时间　" + view["reviewed_at"])
                 display_report(view["content"])
             # 已通过但尚未发布时也走等待分支，医生仍需点击发布按钮。
             elif view["task_status"] == "in_review":
                 st.info("报告正在等待医生审核或发布。")
+            elif view["task_status"] == "completed":
+                st.info("本次随访已结束，目前没有可查看的已发布报告。")
             return
         # 医生可以在报告旁核对同一个 record_id 的提交版本和原始读数。
         if view.get("record"):
             with st.expander("本次提交的原始记录", expanded=True):
-                st.json(view["record"])  # 含提交版本和完整测量时间，供医生与下方报告逐项对照。
+                show_record(view["record"])  # 使用患者确认时的正式版本，中文展示原始信息。
         if "content" not in view:
+            if view["task_status"] in EDITABLE_STATES:
+                st.info("正在等待患者填写并确认本次随访信息。")
             return  # 模型失败时仍可看原始记录、重新生成。
-        st.subheader("随访报告")
+        report_states = {"pending_review": "待审核报告", "approved": "待发布报告",
+                         "returned": "已退回的报告", "published": "已发布报告"}
+        st.subheader(report_states.get(view.get("status"), "随访报告"))
+        if view.get("reviewer"):
+            st.caption("审核医生　" + doctor_label(view["reviewer"]))
         display_report(view["content"])
         if view.get("note"):
             st.write("已保存的审核意见", view["note"])
@@ -398,43 +380,17 @@ def show_report_workflow(token, task_id, doctor=False):
                         payload["keep_sources"].append(number)
             payload["note"] = st.text_area("审核意见（退回时请写明需要补充什么）",
                                            max_chars=2000, key="note_" + key)
-            if st.button("确认审核", key="review_" + key):
+            if st.button("确认审核", key="review_" + key, type="primary"):
                 request_api("POST", path + "/review", token=token, data=payload)
                 st.rerun()
         elif view["status"] == "approved":
             st.info("审核已通过，发布后患者即可查看。")
-            if st.button("发布给患者", key="publish_" + key):
+            if st.button("发布给患者", key="publish_" + key, type="primary"):
                 payload["action"] = "publish"
                 request_api("POST", path + "/review", token=token, data=payload)
                 st.rerun()
     except requests.RequestException as error:
         show_request_error(error)  # 保留可修改的输入；409 时刷新版本，503 时可重新生成。
-
-
-def show_doctor_reviews(token):
-    """用 GET /tasks 展示名下需生成或审核的任务；只为选中任务加载病历和报告。"""
-    st.subheader("报告审核")
-    try:
-        # GET /tasks 已按登录医生过滤，页面再筛出现在能处理的任务。
-        tasks = request_api("GET", "/tasks", token=token).json()
-    except requests.RequestException as error:
-        show_request_error(error)
-        return
-    choices = {}  # 中文任务标签对应稳定的 task_id，重名患者也不会选错记录。
-    for task in tasks:
-        # submitted 表示可重试生成，in_review 涵盖待审核和已审核待发布。
-        if task["task_status"] in ("submitted", "in_review"):
-            label = f"{task.get('patient_name', '')} · {task['followup_date']} · {task['task_id']}"
-            choices[label] = task["task_id"]
-    if not choices:
-        st.caption("当前没有需要生成、审核或发布的报告。")
-    else:
-        # index=None 让医生先选择一项任务，打开页面时不会自动展示首位患者的病历。
-        selected = st.selectbox("选择待处理任务", list(choices), index=None, key="review_task")
-        if selected:
-            show_report_workflow(token, choices[selected], doctor=True)
-    if st.button("刷新待处理任务", key="reload_reviews"):
-        st.rerun()
 
 
 def show_patient_draft(token, task_id):
@@ -470,8 +426,6 @@ def show_patient_draft(token, task_id):
         key = "draft_field_" + field
         if key not in st.session_state:
             st.session_state[key] = value  # 仅恢复请求失败期间被清掉的控件，不覆盖本轮新输入。
-    st.subheader("我的随访信息草稿")
-    st.caption("空白表示还没说明，可以先保存部分信息。保存草稿不等于正式提交。")
     if latest.get("risk", {}).get("level") == "high":
         # 及时记录刚读到的高风险，以便下次网络断开时仍能呈现必要提醒。
         st.session_state["draft_loaded_risk"] = {"task_id": task_id, "risk": latest["risk"]}
@@ -497,60 +451,64 @@ def show_patient_draft(token, task_id):
     if latest["revision"] != base["revision"]:
         st.warning("草稿已有更新，当前输入仍保留。请先核对，再放弃当前修改并重新加载，避免覆盖新内容。")
     if draft_has_changes():
-        st.caption("当前有尚未保存的修改。请先保存，再聊天、返回任务列表或退出。")
-    if st.button("放弃当前修改并重新加载", key="draft_discard"):
-        load_draft_fields(latest)  # 用户已明确选择放弃，才替换输入及版本。
-        st.rerun()
-    if latest["missing_fields"]:
-        # 缺项由服务器按“已测量”“有漏服”等条件计算，页面直接列给患者。
-        st.write("已保存草稿还需补充：" + "、".join(latest["missing_fields"]))
-    editable = latest["editable"]  # 即使控件不可编辑，后端保存接口仍要独立校验状态。
-    if not editable:
-        st.info("这项任务当前不能修改草稿，下面仅供查看。")
-    st.selectbox("这次测过血压了吗？", list(DRAFT_CHOICES["bp_measurement_status"]),
-                 key="draft_field_bp_measurement_status", disabled=not editable)
-    for field, label in DRAFT_TEXT_FIELDS.items():
-        # 每个文本框用字段名作 key，保存时可以精确取回相应输入。
-        st.text_input(label, key="draft_field_" + field, disabled=not editable)
-    st.selectbox("最近服药情况", list(DRAFT_CHOICES["medication_adherence"]),
-                 key="draft_field_medication_adherence", disabled=not editable)
-    if st.button("保存草稿", key="draft_save", disabled=not editable):
-        data = {}  # 空输入转换为 None；接口 JSON 中对应 null。
-        try:
-            for field in DRAFT_TEXT_FIELDS:
-                # 去掉首尾空格再判断是否为空，患者可以有意清空之前填过的字段。
-                value = st.session_state["draft_field_" + field].strip()
-                data[field] = None
-                if value:
-                    data[field] = value  # 时间、症状和原因保留文字，不自行推算日期或医学结论。
-                    if field in ("systolic_bp", "diastolic_bp"):
-                        data[field] = int(value)  # 无法转成整数时明确报错，不写成 0。
-            for field, choices in DRAFT_CHOICES.items():
-                # 例如把页面选择“还没测”转换为 not_measured。
-                data[field] = choices[st.session_state["draft_field_" + field]]
-        except ValueError:
-            st.error("高压和低压请填整数；还不知道时留空即可。")
-            return  # 输入仍保留在控件中，患者可以修改。
-        try:
-            # PUT 提交完整可编辑表单；与聊天只提议本轮提到的字段有所区别。
-            request_api("PUT", path, token=token, data={
-                "expected_revision": base["revision"], "data": data,
-            })  # 例如 revision=2；如果服务器已是 3，必须拒绝覆盖。
-        except requests.RequestException as error:
-            if error.response is not None and error.response.status_code in (401, 403, 404):
-                clear_task_selection()  # 写入阶段也可能撤权，立即清除旧草稿和风险缓存。
-                show_request_error(error)
-                st.stop()
-            show_failed_draft_risk(error, task_id)  # 规则提醒独立于写库成功，不被保存失败吞掉。
-            show_request_error(error)
-            # 409 提醒用户重新核对版本，不能自动用过时输入覆盖服务器值。
-            if error.response is not None and error.response.status_code == 409:
-                st.warning("未覆盖服务器草稿。当前输入仍保留，请核对后重新加载。")
-        else:
-            st.session_state["draft_reload"] = True  # 下一轮控件创建前再更新，避免修改已创建的控件。
-            st.session_state["draft_saved_notice"] = True
+        st.caption("当前有尚未保存的修改。可以先问助手，回到这里继续；采集和提交前请先保存。")
+    # 从采集对话转到这张核对单时，显示同一版本，完整后可以直接核对提交。
+    with st.expander("核对随访信息 · 手工修改或确认提交", expanded=not latest["missing_fields"] or draft_has_changes()):
+        st.caption("还没说到的信息可以留空。修改后请先保存，再确认提交。")
+        if st.button("放弃当前修改并重新加载", key="draft_discard"):
+            load_draft_fields(latest)  # 用户已明确选择放弃，才替换输入及版本。
             st.rerun()
-    show_patient_submit(token, task_id, latest, base)  # 提交与保存草稿是两个明确的操作。
+        if latest["missing_fields"]:
+            # 缺项由服务器按“已测量”“有漏服”等条件计算，页面直接列给患者。
+            st.write("已保存草稿还需补充：" + "、".join(latest["missing_fields"]))
+        editable = latest["editable"]  # 即使控件不可编辑，后端保存接口仍要独立校验状态。
+        if not editable:
+            st.info("这项任务当前不能修改草稿，下面仅供查看。")
+        st.selectbox("这次测过血压了吗？", list(DRAFT_CHOICES["bp_measurement_status"]),
+                     key="draft_field_bp_measurement_status", disabled=not editable)
+        for field, label in DRAFT_TEXT_FIELDS.items():
+            # 每个文本框用字段名作 key，保存时可以精确取回相应输入。
+            st.text_input(label, key="draft_field_" + field, disabled=not editable)
+        st.selectbox("最近服药情况", list(DRAFT_CHOICES["medication_adherence"]),
+                     key="draft_field_medication_adherence", disabled=not editable)
+        if st.button("保存草稿", key="draft_save", disabled=not editable):
+            data = {}  # 空输入转换为 None；接口 JSON 中对应 null。
+            try:
+                for field in DRAFT_TEXT_FIELDS:
+                    # 去掉首尾空格再判断是否为空，患者可以有意清空之前填过的字段。
+                    value = st.session_state["draft_field_" + field].strip()
+                    data[field] = None
+                    if value:
+                        data[field] = value  # 时间、症状和原因保留文字，不自行推算日期或医学结论。
+                        if field in ("systolic_bp", "diastolic_bp"):
+                            data[field] = int(value)  # 无法转成整数时明确报错，不写成 0。
+                for field, choices in DRAFT_CHOICES.items():
+                    # 例如把页面选择“还没测”转换为 not_measured。
+                    data[field] = choices[st.session_state["draft_field_" + field]]
+            except ValueError:
+                st.error("高压和低压请填整数；还不知道时留空即可。")
+                return  # 输入仍保留在控件中，患者可以修改。
+            try:
+                # PUT 提交完整可编辑表单；与聊天只提议本轮提到的字段有所区别。
+                request_api("PUT", path, token=token, data={
+                    "expected_revision": base["revision"], "data": data,
+                })  # 例如 revision=2；如果服务器已是 3，必须拒绝覆盖。
+            except requests.RequestException as error:
+                if error.response is not None and error.response.status_code in (401, 403, 404):
+                    clear_task_selection()  # 写入阶段也可能撤权，立即清除旧草稿和风险缓存。
+                    show_request_error(error)
+                    st.stop()
+                show_failed_draft_risk(error, task_id)  # 规则提醒独立于写库成功，不被保存失败吞掉。
+                show_request_error(error)
+                # 409 提醒用户重新核对版本，不能自动用过时输入覆盖服务器值。
+                if error.response is not None and error.response.status_code == 409:
+                    st.warning("未覆盖服务器草稿。当前输入仍保留，请核对后重新加载。")
+            else:
+                st.session_state["draft_reload"] = True  # 下一轮控件创建前再更新，避免修改已创建的控件。
+                st.session_state["draft_saved_notice"] = True
+                st.rerun()
+        show_patient_submit(token, task_id, latest, base)  # 提交与保存草稿是两个明确的操作。
+
 
 
 def clear_login():
@@ -559,7 +517,9 @@ def clear_login():
     # user={...} 保存账号字典；token="示例令牌" 保存登录凭证字符串；message=[...] 保存聊天消息列表。
     # agent 是旧版页面留下的键。当前版本的 Agent 对象在后端，本页面不再创建它。
     # 退出或登录过期时，一起清掉身份、令牌和页面里的聊天历史。
-    for key in ("user", "token", "message", "agent", "selected_task"):
+    for key in ("user", "token", "message", "agent", "selected_task", "selected_patient",
+                "workspace", "chat_scope", "saved_edits", "scope_risk", "patient_filter", "patient_search",
+                "doctor_section", "confirm_logout", "logout_requested"):
         # key 是每轮循环取出的 str，例如第一次为 "user"。
         # pop(key, None) = 删除并返回这个键的旧值；键不存在就返回 None，不报错。
         # 这里没有接收 pop 的返回值，因为我们只想删除，不需要旧内容。
@@ -567,7 +527,6 @@ def clear_login():
 
     # 这个函数不会删除数据库账号，也不会使后端 token 自动失效。
     # 真正“退出登录”还要调用 POST /auth/logout，见下面侧栏按钮的处理顺序。
-    # auth_page 没清理，仍然记录未登录时应该展示 login 还是 register 页面。
 
 
 def show_request_error(error):
@@ -617,260 +576,643 @@ def clear_task_selection():
     st.session_state.pop("selected_task", None)
     # 切换任务不沿用屏幕上的旧对话，避免把前一项任务的问题显示到新任务下。
     st.session_state["message"] = []
+    st.session_state.pop("chat_scope", None)
+    st.session_state.pop("scope_risk", None)
 
 
-def show_task_details(task):
-    """把一个任务字典显示在页面上，返回 None；不请求网络、不写数据库。
+def show_chat(token, mode, task_id=None, patient_id=None, access_scope=None):
+    """按服务端范围发送一轮对话，返回 None；只有 collect 可能触发后端保存草稿。"""
+    # 同一个任务的查询和采集也使用不同上下文，切换时清理旧消息。
+    scope = (st.session_state["user"]["user_id"], mode, patient_id, task_id, access_scope)
+    if st.session_state.get("chat_scope") != scope:
+        st.session_state["message"] = []
+        st.session_state["chat_scope"] = scope
+        st.session_state.pop("scope_risk", None)
+    placeholder = "询问随访安排、医患信息或健康知识"
+    if mode == "collect":
+        placeholder = "说说这次的血压、服药情况，或最近哪里不舒服……"
+    elif st.session_state.get("scope_risk"):
+        show_risk_notice(st.session_state["scope_risk"])
+    # ==================== 用历史数据重新画出聊天消息 ====================
+    # message = {"role":"assistant","content":"你好"}。
+    for message in st.session_state.get("message", []):
+        # chat_message 返回消息容器，role="user" 和 "assistant" 决定身份样式/图标。
+        # with 将这条消息的正文放进对应容器，而不是自动去调用模型。
+        with st.chat_message(message["role"]):
+            # 重新画历史只读取这个列表，不会再次向后端发送历史里的每条问题。
+            st.markdown(message["content"])
 
-    输入示例：{"task_id": "F001", "task_status": "pending", "followup_date": "2026-11-18", ...}。
-    输出是页面上的日期、类型、状态和负责医生；缺失字段显示“未提供”。
-    """
-    # 数据库使用英文状态值，页面将它们显示为患者容易理解的中文。
-    status_names = {
-        "pending": "待随访",
-        "in_progress": "进行中",
-        "submitted": "已提交",
-        "in_review": "审核中",
-        "completed": "已完成",
-        "needs_info": "需补充",
-    }
-    # 未知状态不推断成“已完成”，让页面如实显示状态尚不明确。
-    status_name = status_names.get(task.get("task_status"), "状态待确认")
-    # task.get() 取得对应字段；没有字段时使用“未提供”，不自行推算随访日期。
-    st.write("随访日期：", task.get("followup_date") or "未提供")
-    st.write("截止时间：", task.get("expires_at") or "未提供")
-    st.write("任务类型：", task.get("task_type") or "未提供")
-    st.write("当前状态：", status_name)
-    st.write("负责医生：", task.get("doctor_name") or "未提供")
+    # ==================== 接收这一轮新问题 ====================
+    chat_disabled = mode == "collect" and draft_has_changes()
+    if chat_disabled:
+        st.caption("有手工修改待保存。你仍可打开侧栏「问助手」查询。")
+    risk_box = st.container()  # 单独放置规则提醒，避免模型 reset/error 清除患者需要看到的信息。
+    prompt = st.chat_input(placeholder, max_chars=4000, disabled=chat_disabled, key="chat_prompt")
+    if prompt and prompt.strip():
+        # chat_message(...).write(prompt) 是先创建用户消息容器，再在其中写入文字。
+        st.chat_message("user").write(prompt)
+        # append 把一条字典追加到 list 末尾，返回 None；目的是供下一轮重跑时重画。
+        # 这里只改内存列表，没有 INSERT 到 medical.db.chat_messages。
+        st.session_state["message"].append({"role": "user", "content": prompt})
+
+        with st.chat_message("assistant"):
+            # st.empty() 返回可更新的页面占位对象，不是空字符串。反复更新同一个对象，会替换它原来的内容。
+            # 两个占位让“正在检索...”和模型回答分开，避免每个小片段新增一个气泡。
+            status_box = st.empty()
+            answer_box = st.empty()
+            # answer: str，当前累计回答，例如 "家庭" → "家庭血压" → "家庭血压测量..."。
+            answer = ""
+            # completed: bool，是否收到后端的完整 answer 事件；仅有 delta 不代表完成。
+            completed = False
+            # failed: bool，是否发生网络错误、格式错误或后端发来的 error 事件。
+            failed = False
+            draft_updated = False  # 收到已保存的草稿事件后，结束回答再重新加载页面。
+
+            try:
+                # method="POST"，path="/chat"，token 是登录凭证，data 是问题字典。
+                # 发送当前页面明确绑定的模式和范围，普通问答与草稿采集各自独立。
+                chat_data = {"mode": mode, "message": prompt}
+                if task_id:
+                    chat_data["task_id"] = task_id
+                if patient_id:
+                    chat_data["patient_id"] = patient_id
+                # user_id/role 不从这里传，后端从 token 读取身份，并再次校验任务归属。
+                # stream=True 是 HTTP 读取模式：边收到回复边处理，不等所有回答结束。
+                # 模型流式生成由 ReactAgent 执行；单独设置 stream=True 不会让模型自动流式化。
+                # with 保证回答结束或中断后关闭 HTTP 连接。
+                with request_api("POST", "/chat", token=token, data=chat_data, stream=True) as response:
+                    # response: requests.Response，支持 with，退出时会执行 close()。
+                    # 本接口正文是 NDJSON：每一行都是一个独立 JSON 对象。
+                    # 与登录接口不同，不能直接 response.json() 解析整段多行事件流。
+                    # iter_lines() 返回可迭代对象；for 每次取出一行 bytes，且去掉行尾换行。
+                    # chunk_size=1 控制底层读取块大小，并不表示“一轮循环只得到一个汉字”。
+                    # UTF-8 汉字通常占多个字节；iter_lines 会先拼出完整的一行。
+                    for line in response.iter_lines(chunk_size=1):
+                        if not line:
+                            # 空白行 bytes 为 b""；continue 跳过本次，继续等下一行。
+                            continue
+                        # 两步转换：bytes --decode("utf-8")--> str --json.loads(...)--> dict。
+                        # 例如后端发送一行 {"type":"delta","content":"你好"}，
+                        # 转换后可以用 event["type"] 取 "delta"，用 event["content"] 取 "你好"。
+                        event = json.loads(line.decode("utf-8"))
+                        event_type = event["type"]
+                        content = event["content"]
+
+                        # event_type 是 str；draft/risk 事件正文是字典，其他事件正文是 str。
+                        # 这几个字符串是前后端约定的事件名，不是 Streamlit 自动规定的。
+                        # 一轮可能有多次工具调用，因此不保证每种事件都只出现一次。
+                        # 工具状态与回答分别放置，例如“正在检索高血压知识库”。
+                        if event_type == "status":
+                            # 例：{"type":"status","content":"正在检索高血压知识库……"}。
+                            # 只更新状态位置，不把状态文字拼进最终回答。
+                            status_box.info(content)
+                        elif event_type == "reset":
+                            # Agent 准备调用工具时，之前流出的文字可能是临时过渡语。
+                            # reset 清掉这一轮的临时回答，不删除历史消息列表。
+                            answer = ""
+                            answer_box.empty()
+                        elif event_type == "delta":
+                            # delta = 新增片段；例如 answer="你好"，content="，请问"，
+                            # answer += content 后得到 "你好，请问"。
+                            status_box.empty()
+                            answer += content
+                            # “▌”只是人工添加的生成中光标，不存进 answer 变量和聊天历史。
+                            answer_box.markdown(answer + " ▌")
+                        elif event_type == "answer":
+                            # answer 事件的 content 是完整最终回答，不是又一个新增片段。
+                            # 所以这里用 = 覆盖，不能 +=，否则前面流过的文字会重复一遍。
+                            answer = content
+                            completed = True
+                        elif event_type == "draft":
+                            # 事件只提示后端已保存；页面重跑后再从草稿接口取最新内容与版本。
+                            if mode == "collect" and content["task_id"] == task_id:
+                                draft_updated = True
+                        elif event_type == "risk":
+                            content = dict(content)
+                            content["task_id"] = task_id
+                            st.session_state["scope_risk"] = content
+                            if mode == "collect":
+                                st.session_state["draft_risk_event"] = content
+                            with risk_box:
+                                show_risk_notice(content)  # 即使没有关联任务也及时展示就医提示。
+                        elif event_type == "error":
+                            # HTTP 已经返回 200 开始传流后，模型仍可能失败。
+                            # 因此即使 HTTP 状态正常，也必须检查流中的 error 事件。
+                            status_box.error(content)
+                            failed = True
+                            # break 退出 for 循环，随后离开 with，关闭响应连接。
+                            break
+            except requests.RequestException as error:
+                # 包括发出请求时的错误，以及读取过程中断线、超时等通信错误。
+                show_request_error(error)
+                failed = True
+            except (ValueError, KeyError):
+                # ValueError：JSON 无法解析等；KeyError：缺少 type/content 等约定字段。
+                st.error("回答数据格式异常，请重试。")
+                failed = True
+
+            # 只有收到完整结束事件，才把回答加入历史；断流不保存半句话。
+            # 这三个条件必须同时满足：收到 answer、answer 非空、全过程没有失败。
+            if completed and answer and not failed:
+                status_box.empty()
+                # 最后再显示一次完整文本，移除生成时添加的“▌”。
+                answer_box.markdown(answer)
+                # 这里只追加一条完整助手消息，不是每收到一个 delta 就追加一条。
+                st.session_state["message"].append({"role": "assistant", "content": answer})
+                if draft_updated:
+                    st.session_state["draft_saved_notice"] = True
+                    st.rerun()  # 新一轮只重画历史，不重复发送这条消息。
+            else:
+                # 发生错误时删除屏幕上的半成品，但保留错误提示和用户已经发送的问题。
+                answer_box.empty()
+                if not failed:
+                    # 没有明确报错但连接结束了，仍可能缺少最终 answer，不能当作成功。
+                    status_box.error("未收到完整回答，请重试。")
+
+TASK_STATES = {
+    "pending": "待随访", "in_progress": "进行中", "needs_info": "需补充",
+    "submitted": "已提交", "in_review": "审核中", "completed": "已完成",
+}
+EDITABLE_STATES = ("pending", "in_progress", "needs_info")
 
 
-def show_patient_tasks(token):
-    """显示患者任务列表或当前任务，返回经后端确认的任务字典。
+def task_name(task):
+    """输入接口任务，返回患者易读的标题；只转换约定的出院后天数。"""
+    name = task.get("task_type") or "随访"
+    if name.startswith("D") and name[1:].isdigit():
+        return "出院后第 " + name[1:] + " 天随访"
+    return name
 
-    输入 token 是登录凭证；返回示例：{"task_id": "F001", "task_status": "pending", ...}。
-    尚未选择任务、任务无权访问或请求失败时停止本轮页面，不显示聊天输入。
-    本函数会发送只读 HTTP 请求、更新页面选择，不改变医疗库中的任务状态。
-    """
-    # selected_task 只记录页面正在查看哪项任务，不能替代后端的归属校验。
-    selected_task = st.session_state.get("selected_task")
-    if selected_task is None:
-        # 未选择任务时，先展示服务端根据登录身份筛选的任务列表。
-        st.subheader("我的随访任务")
-        try:
-            # 输出 task_list 是列表，例如 [{"task_id": "F001", ...}, {"task_id": "F002", ...}]。
-            task_list = request_api("GET", "/tasks", token=token).json()
-        except requests.RequestException as error:
-            # 请求失败不等于没有任务；保留错误提示，并提供重新获取的入口。
-            show_request_error(error)
-            if st.button("重新加载任务", key="reload_tasks"):
-                st.rerun()
-            st.stop()
-        # 没关联患者资料或没有安排时，后端返回空列表，不创建替代任务。
-        if not task_list:
-            st.info("当前没有可查看的随访任务。若刚注册，请联系负责人员关联患者资料。")
-            st.stop()
-        # 每项任务单独显示，按钮 key 使用任务编号，避免多个同名按钮相互冲突。
-        for task in task_list:
-            task_id = task["task_id"]
-            st.markdown(f"**随访任务 {task_id}**")
-            show_task_details(task)
-            if st.button("进入任务", key=f"enter_task_{task_id}"):
-                try:
-                    # 列表加载后权限可能改变，进入时再请求详情，由后端重新验证归属。
-                    task_detail = request_api("GET", f"/tasks/{task_id}", token=token).json()
-                except requests.RequestException as error:
-                    # 进入失败时不设置 selected_task，也不开放聊天输入。
-                    show_request_error(error)
-                    st.stop()
-                # 仅在后端确认成功后保存选择；新任务从空的页面对话开始。
-                clear_task_selection()
-                # 只有成功读到授权详情才保存选中状态，下一轮将进入这个任务。
-                st.session_state["selected_task"] = task_detail
-                st.rerun()
-            # 分隔不同任务，让日期和“进入任务”按钮的对应关系清楚。
-            st.divider()
-        # 列表页不执行后面的聊天代码，必须明确进入一项任务。
-        st.stop()
 
-    try:
-        # 每次重跑（包括发送问题）重新取得详情，不继续相信过期的页面选择。
-        task_id = selected_task["task_id"]
-        task_detail = request_api("GET", f"/tasks/{task_id}", token=token).json()
-    except requests.RequestException as error:
-        # 后端把不存在和无权访问统一返回 404；不能继续显示旧任务或旧对话。
-        if error.response is not None:
-            if error.response.status_code in (403, 404):
-                # 撤权时先清任务和聊天历史，再显示错误及返回入口。
-                clear_task_selection()
-        show_request_error(error)
-        # 连接失败时也不显示未经本轮校验的任务信息；用户可以返回后重试。
-        return_label = "返回任务列表"
-        if draft_has_changes():
-            st.warning("尚未保存的修改已暂存在页面中，恢复连接后可继续编辑。")
-            return_label = "放弃修改并返回任务列表"  # 请求失败时若要离开，也应明确告知会放弃修改。
-        if st.button("重新加载当前任务", key="reload_current_task"):
-            st.rerun()
-        # 用户点击返回后清除选中项，下轮 show_patient_tasks 会重新列出任务。
-        if st.button(return_label, key="return_tasks"):
-            clear_task_selection()
-            st.rerun()
-        st.stop()
+def doctor_label(doctor):
+    """输入医生公开资料或 None，返回姓名、科室和职称；不请求网络。"""
+    if not doctor:
+        return "暂未提供"
+    parts = []
+    for field in ("name", "department", "title"):
+        if doctor.get(field):
+            parts.append(doctor[field])
+    return " · ".join(parts) or "暂未提供"
 
-    # 以本次后端结果更新日期、状态等字段，不用进入时留下的旧字典显示任务。
-    st.session_state["selected_task"] = task_detail
-    st.subheader(f"当前随访任务：{task_detail['task_id']}")
-    # 当前任务详情与列表共用一套中文状态名称，避免两处显示不一致。
-    show_task_details(task_detail)
-    # 状态来自后端；提交后的记录只读，不能把保存草稿当成正式提交。
-    if task_detail["task_status"] in ("pending", "in_progress", "needs_info"):
-        st.info("可以和助手聊聊本次情况，检查并保存草稿后，再确认提交随访信息。")
+
+def task_doctor(task):
+    """从当前任务摘要取负责医生，返回可显示的文字；不借用主管医生填空。"""
+    return doctor_label({"name": task.get("doctor_name"), "department": task.get("doctor_department"),
+                         "title": task.get("doctor_title")})
+
+
+def report_doctor_label(doctor, source):
+    """根据报告署名来源显示医生。缺少历史依据时返回说明，不猜测当次负责人。"""
+    if source == "unverified":
+        return "当次负责医生未核实"
+    label = doctor_label(doctor)
+    if source == "current_task":
+        label += "（据当前任务分配）"
+    return label
+
+
+def show_record(record):
+    """输入已授权的正式记录，用中文显示读数、症状和提交版本；不请求网络或写库。"""
+    data = record.get("data") or {}
+    high, low = record.get("systolic_bp"), record.get("diastolic_bp")
+    if high is not None or low is not None:
+        st.write(f"血压　{high if high is not None else '—'} / {low if low is not None else '—'} mmHg")
     else:
-        st.info("这项任务已提交或结束，当前信息仅供查看。")
-    if st.button("返回任务列表", key="return_tasks"):
-        # 有未保存修改时留在本页，让患者自行决定先保存还是放弃。
-        if draft_has_changes():
-            st.warning("还有未保存的修改，请先保存草稿，或明确放弃当前修改后再返回。")
-        else:
-            clear_task_selection()
-            st.rerun()
-    # 返回字典供下面组装聊天请求，task_id 只表示选择，后端仍会独立鉴权。
-    return task_detail
+        measure = record.get("bp_measurement_status")
+        st.write("血压　" + {"not_measured": "未测量", "measured": "已测量，未记录读数"}.get(measure, "未提供"))
+    st.caption(f"提交时间　{record.get('submitted_at') or '未提供'}　·　提交版本 {record.get('revision') or '未提供'}")
+    # 优先使用当前记录明确保存的值；缺失信息如实留空。
+    for field, label in (("measured_at", "测量时间"), ("heart_rate", "心率"), ("symptoms", "症状"),
+                         ("medication_adherence", "服药情况"), ("missed_dose_reason", "漏服原因"),
+                         ("adverse_effects", "用药后不适"), ("risk_reason", "规则提示依据")):
+        value = data.get(field)
+        if value is None:
+            value = record.get(field)
+        if field == "medication_adherence" and value is not None:
+            # 历史字段的 True/False 仅说明是否服过药，不能据此判断是否规律。
+            labels = {"regular": "按时服药", "missed": "有漏服", "not_prescribed": "没有开药",
+                      "True": "已服药，是否按时待核对", "False": "未服药，原因待核对"}
+            value = labels.get(str(value), value)
+        if value is not None and value != "":
+            st.write(label, value)
 
+
+def get_view(token, path):
+    """用登录凭证读取 JSON，失败展示真实错误并返回 None；空列表表示读取成功。"""
+    try:
+        return request_api("GET", path, token=token).json()
+    except requests.RequestException as error:
+        if error.response is not None and error.response.status_code in (403, 404):
+            if path.startswith("/tasks/"):
+                task_id = path.split("/")[2]
+                st.session_state.get("saved_edits", {}).pop(task_id, None)
+            clear_task_selection()  # 清理失去授权的当前视图，其他已暂存任务仍需各自重新授权才能恢复。
+            st.session_state.pop("selected_patient", None)
+        show_request_error(error)
+        if error.response is not None and error.response.status_code == 401:
+            st.stop()  # 身份过期，本轮立即停止，不能继续绘制其他模块。
+        return None
+
+
+def go_home():
+    """返回工作区首页，按任务保留尚未保存的表单内容；只改变页面会话。"""
+    if draft_has_changes():
+        remember_draft_edits()
+        base = st.session_state["draft_base"]  # 保留开始编辑时的版本，恢复后仍能检查冲突。
+        edits = st.session_state.setdefault("saved_edits", {})
+        edits[base["task_id"]] = {"base": base, "edits": dict(st.session_state["draft_edits"])}
+    clear_task_selection()
+    st.session_state.pop("selected_patient", None)
+    st.session_state["workspace"] = "home"
+    st.rerun()
+
+
+def open_task(token, task_id):
+    """用户点选时通过 GET 重查归属；成功才绑定任务、恢复该任务的未保存修改。"""
+    task = get_view(token, f"/tasks/{task_id}")
+    if task is None:
+        st.stop()
+    clear_task_selection()
+    st.session_state["selected_task"] = task
+    cached = st.session_state.get("saved_edits", {}).pop(task_id, None)
+    if cached and task["task_status"] in EDITABLE_STATES:
+        st.session_state["draft_base"] = cached["base"]
+        st.session_state["draft_edits"] = cached["edits"]
+    st.session_state["workspace"] = "task"
+    st.rerun()
+
+
+def task_action(task):
+    """按服务端状态和已保存草稿决定按钮文字；不修改状态或自动提交。"""
+    status = task["task_status"]
+    if status == "needs_info":
+        return "补充随访信息"
+    if status in ("submitted", "in_review"):
+        return "查看审核进度"
+    if status == "completed":
+        if task.get("report_status") == "published":
+            return "阅读报告"
+        return "查看随访"
+    if task.get("draft_needs_clarification") is not None or task.get("draft_revision") or status == "in_progress":
+        return "继续随访"
+    return "开始随访"
+
+
+def task_priority(task):
+    """给患者首页排序，先补充退回资料，再继续草稿或开始最近任务；只返回排序键。"""
+    rank = 3
+    if task["task_status"] == "needs_info":
+        rank = 0
+    elif task["task_status"] in EDITABLE_STATES:
+        rank = 2
+        if task.get("draft_needs_clarification") is not None or task.get("draft_revision") or task["task_status"] == "in_progress":
+            rank = 1
+    return rank, task.get("followup_date") or "", task["task_id"]
+
+
+def task_card(token, task, primary=False, doctor=False):
+    """显示一项随访与对应操作；用户点击后才请求任务详情。"""
+    with st.container(border=True):
+        description, action = st.columns([3, 1])
+        with description:
+            st.markdown("**" + task_name(task) + "**")
+            st.caption(f"{task['followup_date']}　·　{TASK_STATES.get(task['task_status'], '状态待确认')}")
+            if doctor:
+                st.write(task.get("patient_name") or "随访任务")
+                if task.get("report_status") == "approved":
+                    st.caption("审核已通过，等待发布给患者。")
+            elif task.get("report_status") == "published":
+                st.write("本次负责医生　" + report_doctor_label(task.get("report_doctor"), task.get("report_doctor_source")))
+            else:
+                st.write("本次负责医生　" + task_doctor(task))
+            if task["task_status"] == "needs_info":
+                if task.get("review_note"):
+                    st.write("医生请你补充", task["review_note"])
+                else:
+                    st.caption("本次随访需要补充，目前没有可查看的具体意见。")
+            elif not doctor and task["task_status"] in ("submitted", "in_review"):
+                if task.get("submitted_at"):
+                    st.caption("提交时间　" + task["submitted_at"])
+                if task["task_status"] == "submitted":
+                    st.write("记录已保存，正在等待整理报告。")
+                else:
+                    st.write("报告已进入审核流程，发布后可以阅读。")
+            elif task.get("draft_needs_clarification") is not None and task["task_status"] in EDITABLE_STATES:
+                progress = "已保存，可继续填写"
+                if task.get("draft_needs_clarification") == 0:
+                    progress = "已保存，请核对并确认提交"
+                st.caption(progress)
+            if task["task_status"] == "completed" and task.get("report_date"):
+                st.caption("报告日期　" + task["report_date"])
+        with action:
+            label = task_action(task)
+            if doctor:
+                label = "查看本次随访"
+                if task.get("report_status") == "pending_review":
+                    label = "审核报告"
+                elif task.get("report_status") == "approved":
+                    label = "前往发布"
+                elif task["task_status"] == "submitted":
+                    label = "查看生成进度"
+            style = "secondary"
+            if primary:
+                style = "primary"
+            if st.button(label, key="enter_task_" + task["task_id"], type=style):
+                open_task(token, task["task_id"])
+
+
+def show_patient_home(token):
+    """读取本人档案与任务；首页突出当前动作，按日期另列已发布报告。"""
+    st.title("我的随访")
+    profiles = get_view(token, "/patients")
+    if profiles:
+        st.write("主管医生　" + doctor_label(profiles[0].get("primary_doctor")))
+    elif profiles == []:
+        st.caption("该账号尚未关联患者档案。")
+    tasks = get_view(token, "/tasks")
+    if tasks is None:
+        if st.button("重新加载任务", key="reload_tasks"):
+            st.rerun()
+        return
+    upcoming, reports, closed = [], [], []
+    for task in tasks:
+        if task["task_status"] == "completed" and task.get("report_status") == "published":
+            reports.append(task)
+        elif task["task_status"] == "completed":
+            closed.append(task)  # 某些旧任务已结束，但目前没有可以阅读的已发布报告。
+        else:
+            upcoming.append(task)
+    upcoming.sort(key=task_priority)
+    st.subheader("下一步")
+    if upcoming:
+        task_card(token, upcoming[0], primary=True)
+        if len(upcoming) > 1:
+            with st.expander("其他随访安排", expanded=False):
+                for task in upcoming[1:]:
+                    task_card(token, task)
+    elif tasks:
+        st.info("当前随访均已完成，可以阅读下方的报告。")
+    else:
+        st.info("目前没有随访安排。你也可以从侧栏问助手。")
+    st.subheader("历次随访报告")
+    if not reports:
+        st.caption("医生发布后，可在这里阅读报告。")
+    # 按报告日期倒序；旧报告缺少日期时，使用本次随访日期。
+    def report_order(task):
+        """输入任务摘要，返回历史报告排序日期。"""
+        return task.get("report_date") or task.get("followup_date") or ""
+    for task in sorted(reports, key=report_order, reverse=True):
+        task_card(token, task)
+    if closed:
+        with st.expander("其他已结束的随访"):
+            for task in closed:
+                task_card(token, task)
+
+
+def open_patient(patient_id):
+    """从医生名册选择一位患者；详情页会再次请求后端核对权限。"""
+    clear_task_selection()
+    st.session_state["selected_patient"] = patient_id
+    st.session_state["workspace"] = "patient"
+    st.rerun()
+
+
+def show_physician_home(token):
+    """显示授权名册、待办和风险通知；当前栏目独立读取，失败可以切换其他栏目。"""
+    st.title("医生工作台")
+    section = st.radio("工作台栏目", ["我的患者", "待办随访", "风险通知"], horizontal=True, key="doctor_section")
+    if section == "待办随访":
+        tasks = get_view(token, "/tasks")
+        if tasks is None:
+            return
+        count = 0
+        for task in tasks:
+            if task["task_status"] in ("submitted", "in_review"):
+                count += 1
+                task_card(token, task, doctor=True)
+        if not count:
+            st.info("当前没有待处理的随访。")
+        return
+    if section == "风险通知":
+        if st.button("刷新风险通知", key="reload_notifications"):
+            st.rerun()
+        notices = get_view(token, "/notifications")
+        if notices == []:
+            st.info("当前没有风险通知。")
+        for notice in notices or []:
+            with st.container(border=True):
+                st.markdown("**" + notice["patient_name"] + "**")
+                st.warning(notice["message"])
+                st.caption(notice["created_at"])
+                if st.button("查看相关随访", key="notice_" + str(notice["id"])):
+                    open_task(token, notice["task_id"])
+        return
+    patients = get_view(token, "/patients")
+    if patients is None:
+        return
+    search_col, filter_col = st.columns([1, 2])
+    search = search_col.text_input("搜索患者姓名", key="patient_search").strip()
+    categories = ["全部", "待我处理", "待患者填写", "已完成随访", "暂无任务"]
+    category = filter_col.selectbox("按随访状态筛选", categories, key="patient_filter")
+    flags = {"待我处理": "has_review", "待患者填写": "has_to_fill", "已完成随访": "has_completed"}
+    count = 0
+    for patient in patients:
+        if search and search not in patient["patient_name"]:
+            continue
+        if category in flags and not patient[flags[category]]:
+            continue
+        if category == "暂无任务" and patient["task_count"]:
+            continue
+        count += 1
+        with st.container(border=True):
+            summary, status = st.columns([3, 2])
+            # 姓名按钮用稳定患者编号作 key；同名不会打开对方的档案。
+            if summary.button(patient["patient_name"], key="patient_" + patient["patient_id"],
+                              help="打开患者档案", icon=":material/person:"):
+                open_patient(patient["patient_id"])
+            # 一位患者可由多位医生分次随访；说明当前登录医生为什么能查看此人。
+            relation = "我负责其中的随访"
+            if patient["is_primary"]:
+                relation = "我是主管医生"
+            summary.caption(relation + "　·　" + patient_summary(patient))
+            states = []
+            for title, flag in flags.items():
+                if patient[flag]:
+                    states.append(title)
+            status.write(" · ".join(states) or "暂无任务")
+            if patient.get("latest_followup_date"):
+                status.caption("最近随访安排　" + patient["latest_followup_date"])
+    if not count:
+        st.info("当前没有符合条件的患者。")
+
+
+def patient_summary(patient):
+    """用档案已有字段显示性别、年龄和诊断；不推算未知资料。"""
+    parts = []
+    if patient.get("gender"):
+        gender = str(patient["gender"])
+        labels = {"male": "男", "female": "女", "unknown": "性别未记录"}
+        parts.append(labels.get(gender, gender))
+    if patient.get("age") is not None:
+        parts.append(str(patient["age"]) + " 岁")
+    if patient.get("diagnosis"):
+        parts.append(patient["diagnosis"])
+    return " · ".join(parts) or "基本资料暂未提供"
+
+
+def show_discharge_medications(raw):
+    """显示出院时记录的处方明细；输入可能为 JSON 列表、旧版文字或空值，不推算剂量。"""
+    st.markdown("**出院用药**")
+    if not raw:
+        st.caption("未提供")
+        return
+    medications = raw
+    if isinstance(raw, str):
+        try:
+            medications = json.loads(raw)  # 新格式通常是一组药品，每种药保存独立的规格和用法。
+        except ValueError:
+            st.write(raw)  # 旧资料可能是一段医嘱文字，直接显示原文。
+            return
+    if not isinstance(medications, list):
+        st.write(raw)
+        return
+    if not medications:
+        st.caption("未提供")
+    for medicine in medications:
+        if not isinstance(medicine, dict):
+            st.write(medicine)
+            continue
+        st.write(medicine.get("name") or "药名未提供")
+        parts = []
+        for key, label in (("strength", "规格"), ("dose", "每次用量"), ("route", "途径"), ("frequency", "频次")):
+            if medicine.get(key):
+                parts.append(label + " " + str(medicine[key]))
+        if medicine.get("quantity") is not None:
+            parts.append("数量 " + str(medicine["quantity"]) + str(medicine.get("quantity_unit") or ""))
+        if parts:
+            st.caption("　·　".join(parts))
+        if medicine.get("note"):
+            st.caption(medicine["note"])
+
+
+def show_patient_profile(token, detail):
+    """展示已获授权的患者档案、出院信息、随访任务与正式记录；不写入数据。"""
+    patient = detail["patient"]
+    st.title(patient["patient_name"] + "的档案")
+    st.write(patient_summary(patient))
+    st.write("主管医生　" + doctor_label(patient.get("primary_doctor")))
+    st.write("既往病史", patient.get("medical_history") or "未提供")
+    st.subheader("随访安排与报告")
+    for task in detail["tasks"]:
+        task_card(token, task, doctor=True)
+    if not detail["tasks"]:
+        st.caption("目前没有可查看的随访任务。")
+    for title, rows in (("出院资料", detail["discharges"]), ("正式随访记录", detail["records"])):
+        with st.expander(title + f"（{len(rows)}）"):
+            if not rows:
+                st.caption("暂无记录。")
+            for row in rows:
+                if title == "正式随访记录":
+                    show_record(row)
+                else:
+                    st.markdown("**" + str(row.get("discharge_date") or "日期未提供") + " 出院**")
+                    for key, label in (("discharge_diagnosis", "出院诊断"), ("discharge_instructions", "出院医嘱")):
+                        st.write(label, row.get(key) or "未提供")
+                    show_discharge_medications(row.get("discharge_medications"))
+                    if row.get("baseline_bp_systolic") is not None or row.get("baseline_bp_diastolic") is not None:
+                        st.write("出院基线血压", str(row.get("baseline_bp_systolic") or "—") + " / "
+                                 + str(row.get("baseline_bp_diastolic") or "—") + " mmHg")
+                    if row.get("baseline_heart_rate") is not None:
+                        st.write("出院基线心率", str(row["baseline_heart_rate"]) + " 次/分")
+                st.divider()
+
+
+def show_task_page(token, task, doctor):
+    """呈现本次随访的当前步骤；采集、人工修改与报告审核分别由明确操作触发。"""
+    title = task_name(task)
+    if doctor and task.get("patient_name"):
+        title = task["patient_name"] + " · " + title
+    st.title(title)
+    st.write(f"{task['followup_date']}　·　{TASK_STATES.get(task['task_status'], '状态待确认')}")
+    if task.get("report_status") != "published" or doctor:
+        st.caption("任务负责医生　" + task_doctor(task))
+    if task.get("expires_at"):
+        st.caption("截止时间　" + task["expires_at"])
+    if doctor:
+        if task.get("patient_id") and st.button("查看患者档案 · " + str(task.get("patient_name") or ""), key="task_patient"):
+            open_patient(task["patient_id"])
+        show_report_workflow(token, task["task_id"], doctor=True)
+        return
+    if st.session_state.pop("draft_submit_notice", None):
+        st.success("本次随访已提交，记录已保存。")
+    status = task["task_status"]
+    if status in ("submitted", "in_review", "needs_info", "completed"):
+        show_report_workflow(token, task["task_id"])
+    if status in EDITABLE_STATES:
+        st.subheader("补充本次情况" if status == "needs_info" else "填写本次随访")
+        # 聊天显示在核对单前面；只有草稿读取成功后才启用采集输入。
+        conversation = st.container()
+        show_patient_draft(token, task["task_id"])
+        with conversation:
+            if not st.session_state.get("message"):
+                st.caption("可以从最近一次血压测量说起。助手会把你说的内容整理到下方核对单。")
+            show_chat(token, "collect", task_id=task["task_id"])
 
 # ==================== 页面上方固定内容 ====================
 # 先接住浏览器刚提交的输入，再请求身份、任务和草稿，避免网络失败让未保存内容消失。
 remember_draft_edits()
 # 这几句每次脚本重跑都会执行。set_page_config 设置浏览器标签标题和图标，
-st.set_page_config(page_title="高血压随访助手", page_icon="💬")
-st.title("高血压随访助手")
-st.caption("查询随访安排、出院信息和近期记录，也可以询问高血压相关知识。")
-st.divider()
+st.set_page_config(page_title="高血压随访助手", page_icon="🩺", layout="wide")
+# 仅设置布局与主要按钮的颜色，保留 Streamlit 对键盘、窄屏和深色模式的支持。
+st.html("""
+<style>
+    .stMainBlockContainer {max-width: 70rem; padding-top: 3rem;}
+    [data-testid="stSidebar"] h1 {font-size: 1.5rem;}
+    [data-testid="stBaseButton-primary"], [data-testid="stBaseButton-primaryFormSubmit"] {
+        background-color: #176c62; border-color: #176c62; color: white;
+    }
+    [data-testid="stBaseButton-primary"]:hover, [data-testid="stBaseButton-primaryFormSubmit"]:hover {
+        background-color: #12584f; border-color: #12584f; color: white;
+    }
+    @media (max-width: 700px) { .stMainBlockContainer {padding-top: 2rem;} }
+</style>
+""")
 
-# ==================== 决定本轮该显示哪个页面 ====================
-# 当前会话状态示例（不是一段需要你执行的初始化代码）：
-# {
-#   "auth_page": "login",            # str，未登录时的页面选择
-#   "register_success": True,        # bool，注册成功后的一次性提示，可不存在
-#   "user": {"user_id": "U001", "username": "patient_sun", "role": "patient"},
-#   "token": "一串随机登录凭证",       # str，后端返回，不能用用户名代替
-#   "message": [                     # list[dict]，用于前端重新绘制聊天历史
-#       {"role": "user", "content": "你好"},
-#       {"role": "assistant", "content": "你好，请问有什么需要帮助？"}
-#   ]
-# }
-# st.session_state 是类似字典的对象，支持 []、get()、pop()、in；
-# 在同一连接会话内因按钮等交互重跑时可以继续读取，浏览器刷新/重连则不保证。
-if "auth_page" not in st.session_state:
-    # 只在键不存在时设默认值，避免每次重跑都把注册页强制改回登录页。
-    st.session_state["auth_page"] = "login"
 
-# 旧页面只有 user、没有后端令牌；切换到医疗库后要求重新登录。
-if not st.session_state.get("token"):  # get("token") 在键不存在时返回 None
-    # 没有token时  清空登录状态
-    clear_login()
+# 未登录时只提供两类已开通账号的登录入口。
+if not st.session_state.get("token"):
+    clear_login()  # 清理已失效的身份、选择和历史，避免账号之间混用页面内容。
+    # 宽屏登录框保持舒适行宽，小屏自动收缩到可用宽度。
+    with st.container(horizontal_alignment="center"):
+        with st.container(width=480):
+            st.title("高血压随访助手")
+            st.subheader("登录")
+            with st.form("login_form"):
+                # 选择身份只表明想进入哪个工作区；后端会再次验证实际账号角色。
+                identity = st.radio("登录身份", ["患者", "医生"], horizontal=True)
+                name = st.text_input("姓名", max_chars=64)
+                password = st.text_input("密码", type="password", max_chars=128)
+                submitted = st.form_submit_button("登录", type="primary")
 
-# 如果还没登录 / 注册
-if st.session_state.get("user") is None:
-    # 注册页。
-    if st.session_state["auth_page"] == "register":
-        st.subheader("患者注册")
-        st.caption("新账号关联患者资料后可查询随访记录；医生请使用已开通的账号登录。")
-        with st.form("register_form"):
-            # st.form 返回表单容器，with 表示里面的输入框和按钮放进同一表单。
-            # "register_form" 是这个表单的标识，不是接口路径，也不是数据库表名。
-            # text_input 返回 str：没填时为 ""，例如填完后 username="patient_sun"。
-            username = st.text_input("用户名", max_chars=64)
-            # type="password" 只是把屏幕上的字符遮住，变量本身仍是原始密码字符串。
-            # 页面不做密码哈希；哈希和保存由后端 user_store.register_user() 执行。
-            password = st.text_input("密码", type="password", max_chars=128)
-            confirm_password = st.text_input("确认密码", type="password", max_chars=128)
-            # submitted 是 bool；本轮因点击“注册”提交表单时为 True，平时为 False。
-            # 因此不会在页面刚打开、用户尚未点击注册时就发送注册请求。
-            submitted = st.form_submit_button("注册")
-
-        if submitted:
-            # strip() 返回去掉两端空白的新字符串，例如 " 小王 " → "小王"。
-            # 密码不 strip，用户实际输入的密码内容会原样交给后端。
-            if not username.strip() or not password:
-                st.warning("请输入用户名和密码。")
-            elif password != confirm_password:
-                st.warning("两次输入的密码不一致。")
+    if submitted:
+        if not name.strip() or not password:
+            st.warning("请输入姓名和密码。")
+        else:
+            role = "patient"
+            if identity == "医生":
+                role = "doctor"
+            # 保留原接口的 username 键，里面传用户填写的姓名，例如“李明”。
+            login_data = {"username": name.strip(), "password": password, "role": role}
+            try:
+                result = request_api("POST", "/auth/login", data=login_data).json()
+            except requests.RequestException as error:
+                show_request_error(error)  # 身份、姓名或密码错误时留在登录页。
             else:
-                try:
-                    # method="POST"：提交内容；path="/auth/register"：后端路由。
-                    # data 是 dict，例如 {"username": "patient_sun", "password": "示例密码"}。
-                    # confirm_password 只用于本地比较，不需要发给后端。
-                    # 此时还没登录，省略 token，使用默认值 None。
-                    # 注册由后端写入 medical.db，页面不执行 SQL。
-                    request_api("POST", "/auth/register", data={"username": username.strip(), "password": password})
-                    # 成功返回 Response（HTTP 201），本处不读取其正文。
-                    # request_api 内已检查 HTTP 错误；能执行到 try 的结尾即表示请求成功。
-                except requests.RequestException as error:
-                    # 连接失败、超时、后端返回错误状态等，都用同一个展示函数处理。
-                    show_request_error(error)
-                else:
-                    # try/except/else 的 else 只在 try 没有抛异常时执行。
-                    # 先改状态，再重跑；新一轮就会进入下面的登录页分支。
-                    st.session_state["auth_page"] = "login"
-                    st.session_state["register_success"] = True
-                    # st.rerun() 立即结束本轮并安排从头执行，不是仅重新画这一行。
-                    st.rerun()
-
-        if st.button("已有账号？去登录"):
-            # 普通 button 也返回 bool；点击后的这一轮为 True。
-            # 只切换页面状态，不注册、不登录，也不访问数据库。
-            st.session_state["auth_page"] = "login"
-            st.rerun()
-    # 登录页(默认页)
-    else:
-        st.subheader("登录")
-        if st.session_state.pop("register_success", False):
-            # pop 同时“取出并删除”这个标记，让成功提示仅在这一轮显示。
-            # 键不存在时返回 False，就不会显示注册成功提示。
-            st.success("注册成功，请登录。")
-        with st.form("login_form"):
-            # 两个返回值都是 str；表单提交后，这一轮取得用户提交的文本。
-            username = st.text_input("用户名", max_chars=64)
-            password = st.text_input("密码", type="password", max_chars=128)
-            submitted = st.form_submit_button("登录")
-
-        if submitted:
-            if not username.strip() or not password:
-                st.warning("请输入用户名和密码。")
-            else:
-                try:
-                    # 这一行可以拆开理解（下面只是注释，不会额外执行两次请求）：
-                    # response = request_api("POST", "/auth/login", data={...})
-                    # result = response.json()
-                    # response 是 HTTP 回复对象；result 才是解析后的 Python 字典。
-                    # 后端 login_user 查 medical.db.users、验证密码哈希，成功后
-                    # 把新 token 的哈希和过期时间写入 sessions，再返回以下形状：
-                    # {
-                    #   "access_token": "示例随机令牌",
-                    #   "user": {"user_id": "U001", "username": "patient_sun", "role": "patient"}
-                    # }
-                    result = request_api("POST", "/auth/login", data={"username": username.strip(), "password": password}).json()
-                except requests.RequestException as error:
-                    show_request_error(error)
-                else:
-                    # result 示例：{"access_token": "...", "user": {"username": "张某", "role": "patient", ...}}。
-                    # 外层字典里的 access_token 是 str，user 是另一个 dict。
-                    # token 是登录通行凭证，不是大模型计费用的 token，也不是密码。
-                    st.session_state["token"] = result["access_token"]
-                    st.session_state["user"] = result["user"]
-                    # 新登录清掉之前选择的任务和对话，避免显示上一位用户的信息。
-                    clear_task_selection()
-                    # 下一轮有 user 和 token，将跳过登录/注册分支，进入聊天页面。
-                    st.rerun()
-
-        if st.button("没有账号？去注册"):
-            st.session_state["auth_page"] = "register"
-            st.rerun()
-
-    # stop 停止本轮脚本后续代码；上面已经画出的登录/注册元素仍然显示。
-    # 它不关闭 Streamlit 服务。下次点击按钮仍会触发一轮新执行。
-    # 成功登录时 st.rerun() 已经打断本轮，因此不会再走到这里。
-    st.stop()  # 没有登录时，不显示后面的聊天页面。
+                st.session_state["token"] = result["access_token"]
+                st.session_state["user"] = result["user"]  # 工作区只取服务端确认的角色。
+                clear_task_selection()
+                st.rerun()
+    st.stop()  # 未完成身份验证前不显示患者或医生的数据。
 
 # ==================== 已登录区域：先核对身份，再显示聊天 ====================
 # 每次页面重跑都向后端核对身份
@@ -894,6 +1236,9 @@ except requests.RequestException as error:
 previous_user = st.session_state.get("user", {})
 if previous_user.get("user_id") != user["user_id"] or previous_user.get("role") != user["role"]:
     clear_task_selection()
+    for key in ("workspace", "selected_patient", "saved_edits", "chat_scope", "scope_risk", "patient_search", "patient_filter",
+                "doctor_section", "confirm_logout", "logout_requested"):
+        st.session_state.pop(key, None)  # 账户更换后清理之前身份的页面记忆。
 # 把本轮已核对的身份保存给下次比较，页面权限以本轮 /me 返回值为准。
 st.session_state["user"] = user
 # 后端只允许 patient/doctor 通过这里；用户不通过页面自己选择角色。
@@ -903,170 +1248,104 @@ if user["role"] == "doctor":
 with st.sidebar:
     # sidebar 是 Streamlit 的侧栏容器。其内部元素显示在左侧，而不是正文中间。
     # f 字符串会把花括号中的变量值填进去，例如最终为 "patient_sun · 患者"。
+    st.title("随访助手")
     st.write(f"{user['username']} · {role_name}")
+    landing = "我的随访"
+    if user["role"] == "doctor":
+        landing = "医生工作台"
+    if st.button(landing, key="return_tasks", width="stretch"):
+        go_home()
+    if st.button("问助手", key="open_assistant", width="stretch"):
+        # 保持当前患者/任务与未保存编辑，查询模式无法向后端提议修改草稿。
+        st.session_state["workspace"] = "assistant"
+        st.rerun()
+    st.divider()
     if st.button("退出登录"):
-        if draft_has_changes():
-            st.warning("还有未保存的修改，请先保存草稿，或明确放弃当前修改后再退出。")
+        if draft_has_changes() or st.session_state.get("saved_edits"):
+            st.session_state["confirm_logout"] = True
         else:
-            try:
-                # 通知后端删除登录凭证，再清理页面；不会删除已经保存的草稿。
-                request_api("POST", "/auth/logout", token=token)
-            except requests.RequestException as error:
-                show_request_error(error)
-                st.stop()  # 退出失败时不假装已经撤销了凭证。
-            clear_login()
+            st.session_state["logout_requested"] = True
+    if st.session_state.get("confirm_logout"):
+        st.warning("有尚未保存的手工修改。可以返回任务继续填写。")
+        if st.button("放弃未保存修改并退出"):
+            st.session_state["logout_requested"] = True
+        if st.button("继续使用"):
+            st.session_state.pop("confirm_logout", None)
             st.rerun()
-
-    # 这段灰色文字是写在代码里的固定提示，不是从数据库查出来的任务列表。
-    st.caption("可以问：我的随访什么时候到期？出院时有哪些注意事项？最近血压记录是什么？")
-
-# 患者进入自己的任务，医生在负责范围内处理待审核报告。
-current_task = None
-if user["role"] == "patient":
-    current_task = show_patient_tasks(token)
-    if current_task["task_status"] in ("submitted", "in_review", "needs_info", "completed"):
-        if st.session_state.pop("draft_generation_interrupted", False):
-            st.warning("生成请求未收到成功回执，请查看下方进度，必要时重新生成。")
-        show_report_workflow(token, current_task["task_id"])
-    if current_task["task_status"] == "completed":
-        with st.expander("查看本次已确认的随访信息"):
-            show_patient_draft(token, current_task["task_id"])  # 已完成时收起只读表单，让最终报告优先可见。
-    else:
-        show_patient_draft(token, current_task["task_id"])  # 可编辑任务仍直接显示表单。
-else:
-    show_doctor_notifications(token)  # 紧急风险通知独立于报告，不需要等待模型。
-    show_doctor_reviews(token)
-
-# ==================== 用历史数据重新画出聊天消息 ====================
-# message = {"role":"assistant","content":"你好"}。
-for message in st.session_state.get("message", []):
-    # chat_message 返回消息容器，role="user" 和 "assistant" 决定身份样式/图标。
-    # with 将这条消息的正文放进对应容器，而不是自动去调用模型。
-    with st.chat_message(message["role"]):
-        # 重新画历史只读取这个列表，不会再次向后端发送历史里的每条问题。
-        st.markdown(message["content"])
-
-# ==================== 接收这一轮新问题 ====================
-chat_disabled = draft_has_changes()  # 未保存输入不能与聊天提议相互覆盖。
-if current_task is not None and current_task["task_status"] not in ("pending", "in_progress", "needs_info"):
-    chat_disabled = True  # 已提交或完成的任务停止采集，历史仍供查看。
-risk_box = st.container()  # 单独放置规则提醒，避免模型 reset/error 清除患者需要看到的信息。
-prompt = st.chat_input("请输入你的问题或本次随访情况", max_chars=4000, disabled=chat_disabled)
-if prompt and prompt.strip():
-    # chat_message(...).write(prompt) 是先创建用户消息容器，再在其中写入文字。
-    st.chat_message("user").write(prompt)
-    # append 把一条字典追加到 list 末尾，返回 None；目的是供下一轮重跑时重画。
-    # 这里只改内存列表，没有 INSERT 到 medical.db.chat_messages。
-    st.session_state["message"].append({"role": "user", "content": prompt})
-
-    with st.chat_message("assistant"):
-        # st.empty() 返回可更新的页面占位对象，不是空字符串。反复更新同一个对象，会替换它原来的内容。
-        # 两个占位让“正在检索...”和模型回答分开，避免每个小片段新增一个气泡。
-        status_box = st.empty()
-        answer_box = st.empty()
-        # answer: str，当前累计回答，例如 "家庭" → "家庭血压" → "家庭血压测量..."。
-        answer = ""
-        # completed: bool，是否收到后端的完整 answer 事件；仅有 delta 不代表完成。
-        completed = False
-        # failed: bool，是否发生网络错误、格式错误或后端发来的 error 事件。
-        failed = False
-        draft_updated = False  # 收到已保存的草稿事件后，结束回答再重新加载页面。
-
+    if st.session_state.pop("logout_requested", False):
         try:
-            # method="POST"，path="/chat"，token 是登录凭证，data 是问题字典。
-            # 医生使用原有通用查询；患者额外发送明确选择的 task_id。
-            chat_data = {"message": prompt}
-            if current_task is not None:
-                # 例如 {"message": "这次随访什么时候到期？", "task_id": "F001"}。
-                chat_data["task_id"] = current_task["task_id"]
-            # user_id/role 不从这里传，后端从 token 读取身份，并再次校验任务归属。
-            # stream=True 是 HTTP 读取模式：边收到回复边处理，不等所有回答结束。
-            # 模型流式生成由 ReactAgent 执行；单独设置 stream=True 不会让模型自动流式化。
-            # with 保证回答结束或中断后关闭 HTTP 连接。
-            with request_api("POST", "/chat", token=token, data=chat_data, stream=True) as response:
-                # response: requests.Response，支持 with，退出时会执行 close()。
-                # 本接口正文是 NDJSON：每一行都是一个独立 JSON 对象。
-                # 与登录接口不同，不能直接 response.json() 解析整段多行事件流。
-                # iter_lines() 返回可迭代对象；for 每次取出一行 bytes，且去掉行尾换行。
-                # chunk_size=1 控制底层读取块大小，并不表示“一轮循环只得到一个汉字”。
-                # UTF-8 汉字通常占多个字节；iter_lines 会先拼出完整的一行。
-                for line in response.iter_lines(chunk_size=1):
-                    if not line:
-                        # 空白行 bytes 为 b""；continue 跳过本次，继续等下一行。
-                        continue
-                    # 两步转换：bytes --decode("utf-8")--> str --json.loads(...)--> dict。
-                    # 例如后端发送一行 {"type":"delta","content":"你好"}，
-                    # 转换后可以用 event["type"] 取 "delta"，用 event["content"] 取 "你好"。
-                    event = json.loads(line.decode("utf-8"))
-                    event_type = event["type"]
-                    content = event["content"]
-
-                    # event_type 是 str；draft/risk 事件正文是字典，其他事件正文是 str。
-                    # 这几个字符串是前后端约定的事件名，不是 Streamlit 自动规定的。
-                    # 一轮可能有多次工具调用，因此不保证每种事件都只出现一次。
-                    # 工具状态与回答分别放置，例如“正在检索高血压知识库”。
-                    if event_type == "status":
-                        # 例：{"type":"status","content":"正在检索高血压知识库……"}。
-                        # 只更新状态位置，不把状态文字拼进最终回答。
-                        status_box.info(content)
-                    elif event_type == "reset":
-                        # Agent 准备调用工具时，之前流出的文字可能是临时过渡语。
-                        # reset 清掉这一轮的临时回答，不删除历史消息列表。
-                        answer = ""
-                        answer_box.empty()
-                    elif event_type == "delta":
-                        # delta = 新增片段；例如 answer="你好"，content="，请问"，
-                        # answer += content 后得到 "你好，请问"。
-                        status_box.empty()
-                        answer += content
-                        # “▌”只是人工添加的生成中光标，不存进 answer 变量和聊天历史。
-                        answer_box.markdown(answer + " ▌")
-                    elif event_type == "answer":
-                        # answer 事件的 content 是完整最终回答，不是又一个新增片段。
-                        # 所以这里用 = 覆盖，不能 +=，否则前面流过的文字会重复一遍。
-                        answer = content
-                        completed = True
-                    elif event_type == "draft":
-                        # 事件只提示后端已保存；页面重跑后再从草稿接口取最新内容与版本。
-                        if current_task is not None and content["task_id"] == current_task["task_id"]:
-                            draft_updated = True
-                    elif event_type == "risk":
-                        if current_task is not None:
-                            content = dict(content)  # 另存任务编号，不改变刚解析的事件原文。
-                            content["task_id"] = current_task["task_id"]
-                            st.session_state["draft_risk_event"] = content  # 重跑仍保留，不加入成功助手回答。
-                            with risk_box:
-                                show_risk_notice(content)  # 立即展示，不等模型完成或患者正式提交。
-                    elif event_type == "error":
-                        # HTTP 已经返回 200 开始传流后，模型仍可能失败。
-                        # 因此即使 HTTP 状态正常，也必须检查流中的 error 事件。
-                        status_box.error(content)
-                        failed = True
-                        # break 退出 for 循环，随后离开 with，关闭响应连接。
-                        break
+            request_api("POST", "/auth/logout", token=token)
         except requests.RequestException as error:
-            # 包括发出请求时的错误，以及读取过程中断线、超时等通信错误。
             show_request_error(error)
-            failed = True
-        except (ValueError, KeyError):
-            # ValueError：JSON 无法解析等；KeyError：缺少 type/content 等约定字段。
-            st.error("回答数据格式异常，请重试。")
-            failed = True
+            st.stop()
+        clear_login()
+        st.rerun()
 
-        # 只有收到完整结束事件，才把回答加入历史；断流不保存半句话。
-        # 这三个条件必须同时满足：收到 answer、answer 非空、全过程没有失败。
-        if completed and answer and not failed:
-            status_box.empty()
-            # 最后再显示一次完整文本，移除生成时添加的“▌”。
-            answer_box.markdown(answer)
-            # 这里只追加一条完整助手消息，不是每收到一个 delta 就追加一条。
-            st.session_state["message"].append({"role": "assistant", "content": answer})
-            if draft_updated:
-                st.session_state["draft_saved_notice"] = True
-                st.rerun()  # 新一轮只重画历史，不重复发送这条消息。
-        else:
-            # 发生错误时删除屏幕上的半成品，但保留错误提示和用户已经发送的问题。
-            answer_box.empty()
-            if not failed:
-                # 没有明确报错但连接结束了，仍可能缺少最终 answer，不能当作成功。
-                status_box.error("未收到完整回答，请重试。")
+# 先核对当前页面的资料范围，再绘制资料或聊天，避免重跑时沿用失去权限的缓存。
+workspace = st.session_state.get("workspace", "home")
+doctor = user["role"] == "doctor"
+current_task = None
+selected_patient = st.session_state.get("selected_patient")
+detail = None
+if st.session_state.get("selected_task"):
+    task_id = st.session_state["selected_task"]["task_id"]
+    current_task = get_view(token, f"/tasks/{task_id}")
+    if current_task is None:
+        if st.button("重新加载当前任务", key="reload_current_task"):
+            st.rerun()
+        st.stop()
+    st.session_state["selected_task"] = current_task
+elif selected_patient and doctor:
+    detail = get_view(token, f"/patients/{selected_patient}")
+    if detail is None:
+        st.stop()
+
+if workspace == "assistant":
+    st.title("问助手")
+    scope_label = "我的随访资料"
+    if doctor:
+        scope_label = "我的患者和随访安排"
+    if current_task:
+        scope_label = task_name(current_task) + " · " + current_task["followup_date"]
+        if doctor:
+            scope_label = (current_task.get("patient_name") or "当前患者") + " · " + scope_label
+    elif detail:
+        scope_label = detail["patient"]["patient_name"] + "的资料"
+    st.caption("查询范围　" + scope_label + "　｜　可检索健康知识库")
+    if current_task or detail:
+        if st.button("返回本次随访" if current_task else "返回患者档案", key="resume_context"):
+            st.session_state["workspace"] = "task" if current_task else "patient"
+            st.rerun()
+    if current_task:
+        show_chat(token, "query", task_id=current_task["task_id"], patient_id=current_task.get("patient_id"))
+    elif detail:
+        # 任务改派或主管关系变化时，当前患者编号可能没变，旧问答却不再全部可见。
+        access_scope = []
+        for task in detail["tasks"]:
+            access_scope.append(("任务", task["task_id"]))
+        for discharge in detail["discharges"]:
+            access_scope.append(("出院", discharge["discharge_id"]))
+        show_chat(token, "query", patient_id=selected_patient, access_scope=tuple(sorted(access_scope)))
+    elif doctor:
+        # 医生首页对话可能提及多位患者；任务改派后也需要清理不再属于他的历史。
+        profiles = get_view(token, "/patients")
+        tasks = get_view(token, "/tasks")
+        if profiles is None or tasks is None:
+            st.session_state.pop("chat_scope", None)
+            st.stop()  # 暂不能核实权限，恢复后再展示对话。
+        access_scope = []
+        for patient in profiles:
+            access_scope.append(("患者", patient["patient_id"], bool(patient.get("is_primary"))))
+        for task in tasks:
+            access_scope.append(("任务", task["task_id"], task.get("patient_id") or ""))
+        show_chat(token, "query", access_scope=tuple(sorted(access_scope)))
+    else:
+        show_chat(token, "query")
+elif current_task:
+    show_task_page(token, current_task, doctor)
+elif detail:
+    show_patient_profile(token, detail)
+elif doctor:
+    show_physician_home(token)
+else:
+    show_patient_home(token)

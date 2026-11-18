@@ -1,156 +1,218 @@
-"""读取当前账号有权查看的医疗记录；这里不提交或修改随访数据。"""
+"""患者名册、档案与随访记录的授权只读查询，供页面和 Agent 共用。"""
+
+from contextlib import closing
+import json
 
 from utils.user_store import get_connection
 
 
-def list_followup_tasks(user_id: str, role: str, task_id: str | None = None) -> list[dict]:
-    """输入登录身份和可选任务编号，返回获授权的任务字典列表；只读数据库。
+# 下面的查询共用同一组获授权任务。选择患者、任务只会在登录身份的范围内缩小结果。
+# SQL 的 WITH 给这条临时查询结果取名 my_tasks，不会建表或写入任何数据。
+MY_TASKS = """
+WITH my_tasks AS (
+    SELECT t.*, p.patient_id, p.name AS patient_name,
+           doctor.name AS doctor_name, doctor.department AS doctor_department,
+           doctor.title AS doctor_title
+    FROM followup_tasks t
+    JOIN discharges h ON h.discharge_id=t.discharge_id
+    JOIN patients p ON p.patient_id=h.patient_id
+    JOIN doctors doctor ON doctor.doctor_id=t.doctor_id
+    JOIN users u ON u.user_id=:user_id AND u.role=:role
+    WHERE ((u.role='patient' AND p.user_id=u.user_id)
+        OR (u.role='doctor' AND doctor.user_id=u.user_id))
+      AND (:task_id IS NULL OR t.task_id=:task_id)
+      AND (:patient_id IS NULL OR p.patient_id=:patient_id)
+)
+"""
 
-    例如 ("U001", "patient", "F001") 只查询 F001；不传编号时查所有获授权任务。
-    找不到或没有任务权限时返回 []；不支持的角色抛出 PermissionError。
+# 只找最新正式记录对应的报告，重交之后不会把上次的退回意见当成本次的处理结果。
+TASK_DETAILS = """
+SELECT t.task_id,t.discharge_id,t.followup_date,t.task_type,t.task_status,t.expires_at,
+       t.patient_id,t.patient_name,t.doctor_id,t.doctor_name,t.doctor_department,t.doctor_title,
+       COALESCE(g.revision,0) AS draft_revision,g.needs_clarification AS draft_needs_clarification,
+       r.submitted_at,
+       CASE WHEN b.status='returned' AND t.task_status='needs_info' THEN b.review_note END AS review_note,
+       CASE WHEN :role='doctor' OR (b.status='published' AND t.task_status='completed')
+            THEN b.created_at END AS report_date,
+       CASE WHEN :role='doctor' THEN b.status
+            WHEN b.status='published' AND t.task_status='completed' THEN 'published' END AS report_status,
+       CASE WHEN b.status='published' AND t.task_status='completed'
+            THEN json_extract(b.content_json,'$._responsible_doctor') END AS doctor_snapshot,
+       CASE WHEN b.status='published' AND t.task_status='completed' THEN b.reviewer_id END AS signed_by
+FROM my_tasks t
+LEFT JOIN task_drafts g ON :role='patient' AND g.task_id=t.task_id
+LEFT JOIN followup_records r ON r.record_id=(
+    SELECT record_id FROM followup_records WHERE task_id=t.task_id
+    ORDER BY revision DESC,submitted_at DESC,record_id DESC LIMIT 1)
+LEFT JOIN reports b ON b.record_id=r.record_id AND b.task_id=t.task_id
+ORDER BY t.followup_date,t.task_id
+"""
+
+# 患者本人可以查看自己的出院资料；医生只看与获授权任务相关的出院资料。
+DISCHARGES = """
+SELECT d.discharge_id,d.discharge_date,d.discharge_diagnosis,d.discharge_instructions,
+       d.discharge_medications,d.baseline_bp_systolic,d.baseline_bp_diastolic,d.baseline_heart_rate,
+       p.patient_id,p.name AS patient_name
+FROM discharges d
+JOIN patients p ON p.patient_id=d.patient_id
+JOIN users u ON u.user_id=:user_id AND u.role=:role
+WHERE (:patient_id IS NULL OR p.patient_id=:patient_id)
+  AND ((:task_id IS NULL AND u.role='patient' AND p.user_id=u.user_id)
+       OR EXISTS (SELECT 1 FROM my_tasks t WHERE t.discharge_id=d.discharge_id))
+ORDER BY d.discharge_date DESC,d.discharge_id
+"""
+
+# 同一次任务多次提交分别列出。工具只读最近的记录，选中患者的完整档案读取该范围的全部历史。
+RECORDS = """
+SELECT r.record_id,r.task_id,r.bp_measurement_status,r.systolic_bp,r.diastolic_bp,r.heart_rate,
+       r.symptoms,r.medication_adherence,r.submitted_at,r.revision,t.patient_id,t.patient_name
+FROM my_tasks t
+JOIN followup_records r ON r.task_id=t.task_id
+ORDER BY r.submitted_at DESC,r.revision DESC,r.record_id DESC
+"""
+
+# 主责关系允许查看患者档案，任务关系允许查看负责过的患者；分类只计算本人可见的任务。
+# 带 task_id 时连主管医生都必须先有这项任务的权限，防止用别人的任务号查询患者。
+PATIENTS = """
+SELECT p.patient_id,p.name AS patient_name,p.age,p.gender,p.diagnosis,p.medical_history,
+       primary_doc.doctor_id,primary_doc.name AS doctor_name,
+       primary_doc.department AS doctor_department,primary_doc.title AS doctor_title,
+       CASE WHEN primary_doc.user_id=u.user_id AND u.role='doctor' THEN 1 ELSE 0 END AS is_primary,
+       COUNT(t.task_id) AS task_count,MAX(t.followup_date) AS latest_followup_date,
+       MAX(CASE WHEN t.task_status IN ('submitted','in_review') THEN 1 ELSE 0 END) AS has_review,
+       MAX(CASE WHEN t.task_status IN ('pending','in_progress','needs_info') THEN 1 ELSE 0 END) AS has_to_fill,
+       MAX(CASE WHEN t.task_status='completed' THEN 1 ELSE 0 END) AS has_completed
+FROM patients p
+JOIN users u ON u.user_id=:user_id AND u.role=:role
+LEFT JOIN doctors primary_doc ON primary_doc.doctor_id=p.doctor_id
+LEFT JOIN my_tasks t ON t.patient_id=p.patient_id
+WHERE (:patient_id IS NULL OR p.patient_id=:patient_id)
+  AND (:task_id IS NULL OR t.task_id IS NOT NULL)
+  AND ((u.role='patient' AND p.user_id=u.user_id)
+    OR (u.role='doctor' AND (primary_doc.user_id=u.user_id OR t.task_id IS NOT NULL)))
+GROUP BY p.patient_id
+ORDER BY p.name,p.patient_id
+"""
+
+
+def query_rows(conn, sql, user_id, role, task_id, patient_id):
+    """在给定连接中读取授权字典列表，无匹配返回 []；不支持的角色抛 PermissionError，不写库。
+
+    sql 是本文件中的固定查询，两个编号都是可选范围；查询值通过 SQLite 参数绑定传入。
     """
-
-    # user_id、role 来自后端登录态，例如："U001"、"patient"。
-    # 不接受聊天里自报的身份，也不让管理员默认取得全部医疗数据。
     if role not in ("patient", "doctor"):
-        raise PermissionError("当前账号不能查询随访任务。")
+        raise PermissionError("当前账号不能查询医疗资料。")
+    # 身份来自后端，选择编号来自页面或服务端工具上下文，不能覆盖身份。
+    params = {"user_id": user_id, "role": role, "task_id": task_id, "patient_id": patient_id}
+    rows = conn.execute(MY_TASKS + sql, params).fetchall()
+    items = []
+    for row in rows:
+        items.append(dict(row))  # 变成普通字典，可用于接口 JSON 或 Agent 工具结果。
+    return items
 
-    conn = get_connection()
-    try:
-        # t 是任务，d 是出院记录，p 是患者，doctor 是负责该任务的医生。
-        # 同一条 SQL 中校验归属与任务编号，括号保证编号过滤同时约束两种角色。
-        rows = conn.execute(
-            """
-            SELECT t.task_id, t.discharge_id, t.followup_date,
-                   t.task_type, t.task_status, t.expires_at,
-                   p.patient_id, p.name AS patient_name,
-                   doctor.name AS doctor_name
-            FROM followup_tasks AS t
-            JOIN discharges AS d ON d.discharge_id = t.discharge_id
-            JOIN patients AS p ON p.patient_id = d.patient_id
-            JOIN doctors AS doctor ON doctor.doctor_id = t.doctor_id
-            WHERE ((? = 'patient' AND p.user_id = ?)
-               OR (? = 'doctor' AND doctor.user_id = ?))
-              AND (? IS NULL OR t.task_id = ?)
-            ORDER BY t.followup_date, t.task_id
-            """,
-            (role, user_id, role, user_id, task_id, task_id),
-        ).fetchall()
 
-        # rows 是 sqlite3.Row 列表；转成字典后，接口和 Agent 都能直接使用。
-        # 没绑定患者资料或没有任务时，返回 []，不编造随访计划。
-        tasks = []  # 例如 [{"task_id": "F001", "task_status": "pending", ...}]。
-        for row in rows:
-            tasks.append(dict(row))  # 每条数据库记录转换为一个普通字典。
-        return tasks
-    finally:
-        conn.close()
+def doctor_card(row, prefix):
+    """从已授权查询行取负责或审核医生名片，缺少编号返回 None；仅整理内存数据。"""
+    # 例如 doctor_name 表示当前负责人姓名；reviewer_name 表示审核人姓名。
+    if row[prefix + "_id"] is None:
+        return None
+    return {"doctor_id": row[prefix + "_id"], "name": row[prefix + "_name"],
+            "department": row[prefix + "_department"], "title": row[prefix + "_title"]}
+
+
+def report_assignment(row, snapshot, reviewer_id):
+    """输入当前任务、当次名片与审核人编号，返回（负责医生名片或 None，依据）；不读写数据库。"""
+    if snapshot is not None:
+        return snapshot, "snapshot"  # 保存的当次资料优先，即使后来医生改名或任务改派。
+    assigned = doctor_card(row, "doctor")
+    if reviewer_id is None:
+        return assigned, "current_task"  # 只能说明任务当前分给谁，页面须说明来源。
+    if reviewer_id == row["doctor_id"]:
+        return assigned, "task_and_reviewer"  # 旧报告的实际签署人与任务记录一致。
+    return None, "unverified"  # 当前任务与历史审核记录不同，不能猜测当时是谁负责。
+
+
+def task_summaries(conn, user_id, role, task_id, patient_id):
+    """输入连接、身份和可选范围；返回任务列表及已发布报告的负责医生，不返回报告正文。"""
+    tasks = query_rows(conn, TASK_DETAILS, user_id, role, task_id, patient_id)
+    for task in tasks:
+        saved = task.pop("doctor_snapshot")  # 临时 SQL 字段不直接作为接口内容。
+        reviewer_id = task.pop("signed_by")
+        task["report_doctor"] = None
+        task["report_doctor_source"] = None
+        if task["report_status"] == "published" and task["task_status"] == "completed":
+            snapshot = None
+            if saved is not None:
+                snapshot = json.loads(saved)  # 固定查询仅选择了医生名片，未取建议或正文。
+            doctor, source = report_assignment(task, snapshot, reviewer_id)
+            task["report_doctor"] = doctor
+            task["report_doctor_source"] = source
+    return tasks
+
+
+def list_followup_tasks(user_id: str, role: str, task_id=None, patient_id=None) -> list[dict]:
+    """输入登录身份和可选任务、患者编号，返回授权任务列表；无匹配返回 []，只读数据库。
+
+    每项含患者、负责医生、状态和相关日期，患者还能看到自己的草稿进度及退回说明。
+    """
+    with closing(get_connection()) as conn:
+        return task_summaries(conn, user_id, role, task_id, patient_id)
 
 
 def get_followup_task(user_id: str, role: str, task_id: str) -> dict | None:
-    """输入登录身份和任务编号，返回一个任务字典或 None；只读数据库。
-
-    例如 ("U001", "patient", "F001") 返回 F001 的详情；不存在和越权都返回 None。
-    不支持的角色仍由查询函数抛出 PermissionError。
-    """
-    # 复用同一套 SQL 授权条件，列表与详情不会采用不同的归属标准。
+    """只读指定任务。输入服务端身份和任务编号，无权和不存在均返回 None。"""
     tasks = list_followup_tasks(user_id, role, task_id)
-    if not tasks:  # 空列表表示没有找到可访问的任务。
+    if not tasks:
         return None
-    return tasks[0]  # task_id 是主键，指定编号时最多返回一条记录。
+    return tasks[0]  # 已按主键筛选，至多一项。
 
 
-def list_discharges(user_id: str, role: str, task_id: str | None = None) -> list[dict]:
-    """输入登录身份和可选任务编号，返回获授权的出院信息列表；只读数据库。
+def list_discharges(user_id: str, role: str, task_id=None, patient_id=None) -> list[dict]:
+    """输入登录身份和可选范围，返回按日期倒序的授权出院信息；无匹配返回 []，只读数据库。"""
+    with closing(get_connection()) as conn:
+        return query_rows(conn, DISCHARGES, user_id, role, task_id, patient_id)
 
-    例如指定 F001 时只返回该任务对应的出院信息；无权访问或不存在返回 []。
-    不传编号时保留原有查询范围；不支持的角色抛出 PermissionError。
+
+def list_recent_records(user_id: str, role: str, task_id=None, patient_id=None) -> list[dict]:
+    """输入登录身份及可选范围，返回最近 20 条获准查看的正式记录；无匹配返回 []，只读数据库。"""
+    with closing(get_connection()) as conn:
+        return query_rows(conn, RECORDS + " LIMIT 20", user_id, role, task_id, patient_id)
+
+
+def patient_profiles(conn, user_id, role, patient_id, task_id):
+    """输入连接和授权范围，读取患者资料与独立的主管医生名片；无匹配返回 []，不写库。"""
+    patients = query_rows(conn, PATIENTS, user_id, role, task_id, patient_id)
+    for patient in patients:
+        # 组装显示资料的同时移走临时列，未分配主管医生时返回 None。
+        doctor = {"doctor_id": patient.pop("doctor_id"), "name": patient.pop("doctor_name"),
+                  "department": patient.pop("doctor_department"), "title": patient.pop("doctor_title")}
+        patient["primary_doctor"] = None
+        if doctor["doctor_id"] is not None:
+            patient["primary_doctor"] = doctor
+        # SQLite 聚合标记为 0/1，接口以布尔值区分能进入哪些筛选。
+        for field in ("is_primary", "has_review", "has_to_fill", "has_completed"):
+            patient[field] = bool(patient[field])
+    return patients
+
+
+def list_patients(user_id: str, role: str, patient_id=None, task_id=None) -> list[dict]:
+    """输入当前身份及可选范围，返回患者名册；患者只见自己，无资料返回 []，只读数据库。"""
+    with closing(get_connection()) as conn:
+        return patient_profiles(conn, user_id, role, patient_id, task_id)
+
+
+def get_patient_detail(user_id: str, role: str, patient_id: str) -> dict | None:
+    """输入后端身份、患者编号，返回 patient/discharges/tasks/records；无权或不存在返回 None。
+
+    在同一个只读事务中组装档案，避免医生改派时读到不同权限时刻的数据。
     """
-
-    if role not in ("patient", "doctor"):
-        raise PermissionError("当前账号不能查询出院信息。")
-
-    conn = get_connection()
-    try:
-        # 医生权限依据任务分配，而不是仅凭患者姓名或患者编号。
-        # EXISTS 表示“存在符合条件的任务”；同一次出院的多项任务不会导致重复返回。
-        # 医生的 EXISTS 也检查 task_id，避免拿另一项任务的授权查看本次任务。
-        # 最后的 EXISTS 把患者查询也限制到选中任务关联的那一次出院。
-        rows = conn.execute(
-            """
-            SELECT d.discharge_id, d.discharge_date, d.discharge_diagnosis,
-                   d.discharge_instructions, d.discharge_medications,
-                   d.baseline_bp_systolic, d.baseline_bp_diastolic,
-                   d.baseline_heart_rate, p.patient_id, p.name AS patient_name
-            FROM discharges AS d
-            JOIN patients AS p ON p.patient_id = d.patient_id
-            WHERE ((? = 'patient' AND p.user_id = ?)
-               OR (? = 'doctor' AND EXISTS (
-                   SELECT 1
-                   FROM followup_tasks AS t
-                   JOIN doctors AS doctor ON doctor.doctor_id = t.doctor_id
-                   WHERE t.discharge_id = d.discharge_id
-                     AND doctor.user_id = ?
-                     AND (? IS NULL OR t.task_id = ?)
-               )))
-              AND (? IS NULL OR EXISTS (
-                  SELECT 1
-                  FROM followup_tasks AS selected_task
-                  WHERE selected_task.discharge_id = d.discharge_id
-                    AND selected_task.task_id = ?
-              ))
-            ORDER BY d.discharge_date DESC, d.discharge_id
-            """,
-            (role, user_id, role, user_id, task_id, task_id, task_id, task_id),
-        ).fetchall()
-
-        # 只选择业务所需字段，不把账号、令牌或其他患者资料交给模型。
-        discharges = []  # 例如 [{"discharge_id": "DIS001", "discharge_date": "2026-11-01", ...}]。
-        for row in rows:
-            discharges.append(dict(row))  # 保留 SQL 明确选择的出院字段。
-        return discharges
-    finally:
-        conn.close()
-
-
-def list_recent_records(user_id: str, role: str, task_id: str | None = None) -> list[dict]:
-    """输入登录身份和可选任务编号，返回最近 20 条获授权记录；只读数据库。
-
-    例如指定 F001 时只返回 F001 的记录，保留 record_id 和 revision 区分各次提交。
-    不存在或无权访问时返回 []；不支持的角色抛出 PermissionError。
-    """
-
-    if role not in ("patient", "doctor"):
-        raise PermissionError("当前账号不能查询随访记录。")
-
-    conn = get_connection()
-    try:
-        # 同一任务可以有多次提交，所以保留 record_id 和 revision 区分记录。
-        # 明确列出返回字段；待审核报告、审核意见不会混在血压记录中返回。
-        rows = conn.execute(
-            """
-            SELECT r.record_id, r.task_id, r.bp_measurement_status,
-                   r.systolic_bp, r.diastolic_bp, r.heart_rate,
-                   r.symptoms, r.medication_adherence, r.submitted_at,
-                   r.revision, p.patient_id, p.name AS patient_name
-            FROM followup_records AS r
-            JOIN followup_tasks AS t ON t.task_id = r.task_id
-            JOIN discharges AS d ON d.discharge_id = t.discharge_id
-            JOIN patients AS p ON p.patient_id = d.patient_id
-            JOIN doctors AS doctor ON doctor.doctor_id = t.doctor_id
-            WHERE ((? = 'patient' AND p.user_id = ?)
-               OR (? = 'doctor' AND doctor.user_id = ?))
-              AND (? IS NULL OR t.task_id = ?)
-            ORDER BY r.submitted_at DESC, r.revision DESC, r.record_id DESC
-            LIMIT 20
-            """,
-            (role, user_id, role, user_id, task_id, task_id),
-        ).fetchall()
-
-        # submitted_at 是入库时间，并不代表实际测量时间。
-        records = []  # 例如 [{"record_id": "R001", "task_id": "F001", "revision": 1, ...}]。
-        for row in rows:
-            records.append(dict(row))  # 每条记录仍保留明确的编号、版本和排序。
-        return records
-    finally:
-        conn.close()
+    with closing(get_connection()) as conn:
+        conn.execute("BEGIN")  # 直到档案组装完成，四种查询都看到同一份数据库快照。
+        profiles = patient_profiles(conn, user_id, role, patient_id, None)
+        if not profiles:
+            return None
+        # 出院、随访和正式记录各自只读获授权范围，主管身份本身不会开放其他医生的任务。
+        return {"patient": profiles[0],
+                "discharges": query_rows(conn, DISCHARGES, user_id, role, None, patient_id),
+                "tasks": task_summaries(conn, user_id, role, None, patient_id),
+                "records": query_rows(conn, RECORDS, user_id, role, None, patient_id)}
