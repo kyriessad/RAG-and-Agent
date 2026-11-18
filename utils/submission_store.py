@@ -1,11 +1,10 @@
 """患者确认提交：保存一份不可覆盖的随访记录，并原子更新任务状态。"""
 
-import hashlib
 import json
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from utils.draft_store import missing_draft_fields, read_draft, require_patient_task, validate_draft
+from utils.draft_store import confirmed_record_id, missing_draft_fields, read_draft, require_patient_task, validate_draft
 from utils.risk_rules import evaluate_risk
 from utils.risk_store import save_risk_notification
 from utils.user_store import get_connection
@@ -50,8 +49,7 @@ def submit_task_draft(user_id, role, task_id, expected_revision, confirmed):
         if draft["revision"] != expected_revision:
             raise RuntimeError("草稿已更新，请重新加载并核对后再确认提交。")
         # 同一草稿版本得到固定记录编号；网络重试无需新建表或接收前端生成的编号。
-        identity = f"{task_id}|{expected_revision}"
-        record_id = "FR_" + hashlib.sha256(identity.encode("utf-8")).hexdigest()
+        record_id = confirmed_record_id(task_id, expected_revision)
         existing = conn.execute(
             "SELECT revision,data_json FROM followup_records WHERE record_id=? AND task_id=?",
             (record_id, task_id),

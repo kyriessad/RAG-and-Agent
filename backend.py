@@ -6,8 +6,11 @@ import json
 # 捕获 SQLite 的表、连接或事务异常，统一转成前端可处理的 HTTP 状态。
 import sqlite3
 from contextlib import asynccontextmanager
+from datetime import timedelta, timezone
 from typing import Literal
 
+# 随访的定时扫描运行在后端，浏览器关闭后仍能按时开放任务。
+from apscheduler.schedulers.background import BackgroundScheduler
 # Depends 会在路由执行前调用鉴权函数，HTTPException 会提前结束本次请求。
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException
 # 普通失败用 JSONResponse；聊天用 StreamingResponse 连续发送多行。
@@ -20,7 +23,7 @@ from pydantic import BaseModel, ConfigDict, Field
 # stream_chat 返回事件生成器；forget_session 清理当前 token 对应的内存记忆。
 from agent.tools.chat_session import forget_session, stream_chat
 # 账号查询和令牌撤销集中在 user_store，页面无需了解密码存储格式。
-from utils import followup_store, user_store
+from utils import followup_store, schedule_store, user_store
 from utils import report_store  # 独立处理报告的授权查询、版本检查和事务。
 # 工具查询和 HTTP 查询复用相同的任务权限条件。
 from utils.followup_store import get_followup_task, list_followup_tasks
@@ -36,9 +39,18 @@ from utils.logger_handler import logger
 
 @asynccontextmanager
 async def lifespan(application):
-    """FastAPI 启动时检查已有登录表列，缺库或列不匹配则报错；不建库、不加载模型。"""
+    """启动时升级排期字段、补扫到期事项，每分钟继续扫描；数据库错误向启动方报告。"""
     user_store.init_db()
-    yield  # 检查通过才开始接收 HTTP 请求。
+    schedule_store.migrate_schedule()  # 首次启用时标记已有出院记录，后续启动保留原标记。
+    schedule_store.scan_schedule()  # 停机期间到期的任务从本次实际开放起算 48 小时。
+    scheduler = BackgroundScheduler(timezone=timezone(timedelta(hours=8)))
+    # 每个整分钟扫描。同进程最多运行一份，数据库事务和唯一键负责跨进程去重。
+    scheduler.add_job(schedule_store.scan_schedule, "cron", second=0, coalesce=True, max_instances=1)
+    scheduler.start()
+    try:
+        yield
+    finally:
+        scheduler.shutdown(wait=True)  # 让正在提交的事务完成，再结束后台线程。
 
 
 # FastAPI 启动时收集下方路由并运行一次表结构检查。
@@ -162,7 +174,7 @@ def patients(user: dict = Depends(current_user)):
 
 @app.get("/patients/{patient_id}")
 def patient_detail(patient_id: str, user: dict = Depends(current_user)):
-    """按患者编号读取授权档案、出院和随访；无关联与不存在均返回 404。"""
+    """按患者编号只读授权档案、对方的联系方式、出院和随访；无关联与不存在均返回 404。"""
     detail = followup_store.get_patient_detail(user["user_id"], user["role"], patient_id)
     if detail is None:
         raise HTTPException(status_code=404, detail="患者不存在或无权访问。")
@@ -181,11 +193,11 @@ def tasks(user: dict = Depends(current_user)):
 def task_detail(task_id: str, user: dict = Depends(current_user)):
     """输入任务编号，返回获授权的任务字典；找不到或无权查看均返回 404。
 
-    例如 GET /tasks/F001 返回含 task_id、task_status 的字典。
+    例如患者 GET /tasks/F001 返回含 task_id、task_status 和本次负责人 doctor_phone 的字典。
     本接口只读数据库，不把任务改为进行中，也不创建 Agent。
     """
     # 查询时同时检查编号和登录身份，不能先取出任务再让前端判断权限。
-    task = get_followup_task(user["user_id"], user["role"], task_id)
+    task = get_followup_task(user["user_id"], user["role"], task_id, include_contact=True)
     # 两种情况使用相同响应，不泄露其他账号的任务是否存在。
     if task is None:
         raise HTTPException(status_code=404, detail="任务不存在或无权访问。")
@@ -285,6 +297,15 @@ def doctor_notifications(user: dict = Depends(current_user)):
     try:
         # SQL 同时检查接收人和任务当前负责医生，改派后旧医生无法读取。
         return list_doctor_notifications(user["user_id"], user["role"])
+    except PermissionError as error:
+        raise HTTPException(status_code=403, detail=str(error)) from error
+
+
+@app.get("/notifications/schedule")
+def schedule_notifications(user: dict = Depends(current_user)):
+    """通过登录身份读取仍需本人的随访提醒，无待办时返回 []；只读，不更改通知。"""
+    try:
+        return schedule_store.list_schedule_notifications(user["user_id"], user["role"])
     except PermissionError as error:
         raise HTTPException(status_code=403, detail=str(error)) from error
 

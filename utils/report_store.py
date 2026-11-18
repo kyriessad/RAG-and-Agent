@@ -8,6 +8,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from agent.tools.report_generation import build_report
+from utils import schedule_store
 from utils.followup_store import doctor_card, report_assignment
 from utils.logger_handler import logger
 from utils.user_store import get_connection
@@ -56,10 +57,15 @@ def current_case(conn, user, task_id):
     # LEFT JOIN 让尚未生成报告的任务也能返回；ORDER BY 优先选择正式记录版本最大的那次。
     row = conn.execute("""
         SELECT t.task_status, t.doctor_id, d.name AS doctor_name, d.department AS doctor_department,
-               d.title AS doctor_title, r.record_id, r.revision, r.submitted_at,
+               d.title AS doctor_title, r.record_id, r.revision,
+               -- 新排期任务的显示时间与 48 小时填写期限使用同一时区，保留旧记录的登记格式。
+               CASE WHEN t.scheduled_at IS NOT NULL THEN datetime(r.submitted_at,'+8 hours')
+                    ELSE r.submitted_at END AS submitted_at,
                r.systolic_bp, r.diastolic_bp, r.bp_measurement_status, r.heart_rate, r.symptoms,
                r.medication_adherence, r.risk_level, r.risk_reason, r.data_json,
-               b.report_id, b.status, b.version, b.content_json, b.review_note, b.reviewed_at,
+               b.report_id, b.status, b.version, b.content_json, b.review_note,
+               CASE WHEN t.scheduled_at IS NOT NULL THEN datetime(b.reviewed_at,'+8 hours')
+                    ELSE b.reviewed_at END AS reviewed_at,
                reviewer.doctor_id AS reviewer_id, reviewer.name AS reviewer_name,
                reviewer.department AS reviewer_department, reviewer.title AS reviewer_title
         FROM followup_tasks t
@@ -73,7 +79,8 @@ def current_case(conn, user, task_id):
         LEFT JOIN reports b ON b.record_id=r.record_id AND b.task_id=t.task_id
         LEFT JOIN doctors reviewer ON reviewer.doctor_id=b.reviewer_id
         WHERE t.task_id=? AND (? IS NULL OR p.patient_id=?)
-          AND ((u.role='patient' AND p.user_id=u.user_id)
+          AND ((u.role='patient' AND p.user_id=u.user_id
+                 AND (t.scheduled_at IS NULL OR t.opened_at IS NOT NULL))
                            OR (u.role='doctor' AND d.user_id=u.user_id))
         """, (user["user_id"], user["role"], task_id, user.get("patient_id"), user.get("patient_id"))).fetchone()
     # 即使请求指定正确的 task_id，角色或任务归属不匹配也读不到任何行。
@@ -286,6 +293,9 @@ def review_report(user, task_id, request):
                           request.note, request.report_id))
         # 状态与审核意见共享事务，写审计失败时也会一起撤销。
         conn.execute("UPDATE followup_tasks SET task_status=? WHERE task_id=?", (task_status, task_id))
+        if action == "return":
+            # 与退回意见一起提交补充期限；重复审核请求在版本检查处返回，不延长同一窗口。
+            schedule_store.reset_return_window(conn, task_id)
         audit(conn, user, task_id, request.report_id, "report_" + action,
               {"request": request.model_dump(), "original_content": details.get("original_content")})
     return receipt

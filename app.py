@@ -51,6 +51,8 @@
 
 # NDJSON 每一行都是一条聊天事件；解析后可按 type 更新页面。
 import json
+# 电话号码保留登记格式供复制，拨号链接只使用可识别的号码。
+import re
 # 用 requests 的异常类区分 HTTP 失败和服务无法连接。
 import requests
 import streamlit as st
@@ -250,12 +252,15 @@ def show_patient_submit(token, task_id, latest, base):
         st.session_state["draft_confirm"] = False  # 提交失败后，下一轮先取消旧确认。
     # 完整性只是第一关，下一行还会检查未保存改动和版本过期。
     can_submit = latest["editable"] and not latest["missing_fields"]
-    if draft_has_changes() or latest["revision"] != base["revision"]:
+    if draft_has_changes() or latest["revision"] != base["revision"] or latest.get("returned_draft"):
         can_submit = False  # 页面不把尚未保存的内容说成已经提交。
     if not can_submit:
         st.session_state["draft_confirm"] = False  # 禁用时不保留可能过期的勾选。
     st.divider()
     st.write("确认本次随访信息")
+    if latest.get("returned_draft"):
+        # 后端核对了最近提交的草稿版本；手工补充或对话保存出新版本后即可再次确认。
+        st.info("医生退回了这份记录。请按医生意见告诉助手补充内容，或在核对单中修改后点「保存草稿」，再确认提交。")
     confirmed = st.checkbox("我已核对上面的信息，确认提交本次随访", key="draft_confirm",
                             disabled=not can_submit)  # 默认不勾选，不代替患者确认。
     # 只有患者主动勾选并点击按钮才发出 POST；普通页面重跑不会提交。
@@ -277,26 +282,85 @@ def show_patient_submit(token, task_id, latest, base):
 
 
 def display_report(content):
-    """展示服务端允许当前账号阅读的报告字典；直接展开引用可查看生成时的原文。"""
+    """将已授权的报告字典绘成摘要、关注项和引用；只渲染当前快照，不请求服务或改写正文。"""
+    # 不同版本的规则代码含义不同，采用报告保存时的含义和相应的视觉提示。
+    levels = {"high": ("已触发升级", "red"), "unassessed": ("待评估", "gray"),
+              "no_alert": ("未触发预设告警", "blue"), "no_flag": ("未标记异常", "blue"),
+              "review": ("需要复核", "orange")}
+    level = content.get("risk_level") or "unassessed"
+    label, color = levels.get(level, (level, "gray"))
+    st.badge("规则评估 · " + label, color=color, icon=":material/monitor_heart:")
+    st.markdown("#### 随访摘要")
     if content.get("legacy_report"):
-        st.write(content["summary"])  # 旧报告以 Markdown 保存，保留标题和原有段落。
+        # 已签发的旧版 Markdown 保留其段落，省去与阅读页标题重复的通用标题。
+        summary = content["summary"].removeprefix("# 随访报告\n")
+        st.markdown(summary)
     else:
-        st.text(content["summary"])  # 保留每个确认事实之间的换行，患者原话中的符号按原文显示。
-    # 新旧规则使用过不同的英文代码，页面分别翻译，保留历史语义。
-    levels = {"high": "已触发升级", "unassessed": "待评估", "no_alert": "未触发预设告警",
-              "no_flag": "未标记异常", "review": "需要复核"}
-    level = content.get("risk_level", "unassessed")
-    st.write("规则风险", levels.get(level, level))
-    # 没有关注项时列表为空，页面不会自行补写新的风险判断。
-    for point in content.get("abnormal_points", []):
-        st.write("需关注", point)
-    for recommendation in content.get("recommendations", []):
-        st.write("参考建议", recommendation)  # 文字末尾的〔1〕对应第一条引用。
-    # enumerate 从 1 编号，使标题与建议正文的〔1〕、〔2〕一一对应。
-    for number, source in enumerate(content.get("sources", []), 1):
-        with st.expander(f"〔{number}〕{source['source']} · 查看原文"):
-            st.text(source["excerpt"])  # 使用生成时保存的片段，即使知识库变化也能核对。
-            st.caption("片段编号 " + source["chunk_id"])
+        st.text(content["summary"])  # 患者原话按纯文本换行，符号不会成为网页标记。
+    if content.get("abnormal_points"):
+        st.markdown("#### 需要关注")
+        for point in content["abnormal_points"]:
+            # 部分历史记录在单个关注项中保存了 JSON 字符串列表，阅读时按原顺序换行。
+            if isinstance(point, str) and point.startswith("["):
+                try:
+                    items = json.loads(point)
+                    if isinstance(items, list) and items:
+                        point = "\n".join(items)  # 混入非字符串时抛 TypeError，仍展示原文。
+                except (ValueError, TypeError):
+                    pass
+            st.text(point)
+    if content.get("recommendations"):
+        st.markdown("#### 参考建议")
+        for recommendation in content["recommendations"]:
+            st.text(recommendation)  # 保留建议文字原有的〔1〕等引用编号。
+    if content.get("sources"):
+        st.markdown("#### 引用依据")
+        for number, source in enumerate(content["sources"], 1):
+            with st.expander(f"〔{number}〕{source['source']} · 查看原文"):
+                # 只读报告生成时保存的片段，知识库后续更新不改变这里的依据。
+                st.text(source["excerpt"])
+                st.caption("片段编号 " + source["chunk_id"])
+
+
+def show_report_sheet(view, title):
+    """绘制医生草稿或患者终稿，标题由调用方根据状态提供；只读报告快照，无网络与写入。"""
+    # 只作用于报告单，正文自动折行，手机可上下阅读；背景叠加透明色以适应深色主题。
+    st.html("""
+    <style>
+      .st-key-report_sheet {
+        border-top: 4px solid #27867d !important;
+        border-radius: 14px;
+        background: linear-gradient(150deg, rgba(53,151,137,.09), transparent 30%);
+        box-shadow: 0 5px 18px rgba(20,69,64,.06);
+        padding: clamp(1rem, 2.2vw, 2rem) !important;
+      }
+      .st-key-report_sheet h3 { letter-spacing: .012em; }
+      .st-key-report_sheet h4 { padding: .8rem 0 .22rem; font-size: 1.05rem; }
+      .st-key-report_byline { border-inline-start: 3px solid #78a99e; padding-inline-start: .85rem; }
+      .st-key-report_sheet [data-testid="stText"],
+      .st-key-report_sheet [data-testid="stText"] pre {
+        font-family: inherit; white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.8; max-width: 76ch;
+      }
+      .st-key-report_review_actions { border-radius: 14px; }
+    </style>
+    """)
+    with st.container(key="report_sheet", border=True):
+        st.subheader(title)
+        # 当次负责医生由报告快照或可核实的历史登记给出，与当前任务联系人分别展示。
+        with st.container(key="report_byline", gap="xxsmall"):
+            st.write("本次负责医生", report_doctor_label(view.get("responsible_doctor"),
+                                                    view.get("responsible_doctor_source")))
+            if view.get("reviewer"):
+                signed = "审核医生 · " + doctor_label(view["reviewer"])
+                if view.get("reviewed_at"):
+                    signed += "　｜　" + view["reviewed_at"]
+                st.caption(signed)
+            elif view.get("reviewed_at"):
+                st.caption("审核时间　" + view["reviewed_at"])
+        display_report(view["content"])
+        if view.get("note"):
+            st.markdown("#### 医生意见")
+            st.text(view["note"])  # 署名和意见均来自当前报告版本。
 
 
 def show_report_workflow(token, task_id, doctor=False):
@@ -305,32 +369,37 @@ def show_report_workflow(token, task_id, doctor=False):
     path = f"/tasks/{task_id}/report"
     try:
         view = request_api("GET", path, token=token).json()  # 每轮重新授权，页面不缓存报告正文。
-        if st.button("刷新报告状态", key="refresh_report"):
+        # 等待异步生成、审核或发布时可刷新；已发布的阅读页直接呈现报告正文。
+        can_refresh = view["task_status"] in ("submitted", "in_review") or (doctor and view["task_status"] == "needs_info")
+        if can_refresh and st.button(
+                "刷新报告状态", key="refresh_report", type="tertiary", icon=":material/refresh:"):
             st.rerun()
         # 记录已提交而任务仍在 submitted，说明草稿生成尚未完成。
         if view["task_status"] == "submitted":
             st.info("随访记录已保存，正在等待整理报告。")
-            if doctor and st.button("生成报告草稿", key="generate_report"):
+            if doctor and st.button("生成报告草稿", key="generate_report", type="primary"):
                 with st.spinner("正在检索资料并生成报告……"):
                     # 只发送当前正式记录编号，即使重试多次也不能创建第二条随访记录。
                     request_api("POST", path + "/generate", token=token, data={"record_id": view["record_id"]})
                 st.rerun()  # 成功后重新读取；页面重复刷新不会再次生成。
         # 患者和医生使用不同的页面控件，后端仍对每次 GET 与 POST 独立鉴权。
         if not doctor:
-            if view.get("note"):
-                st.write("医生意见", view["note"])  # 退回只显示补充要求；已发布可查看最终审核意见。
-            elif view["task_status"] == "needs_info":
-                st.info("医生请你补充本次随访信息，当前没有可查看的具体意见。")
+            if view["task_status"] == "needs_info":
+                if view.get("note"):
+                    st.warning("医生请你补充", icon=":material/edit_note:")
+                    st.write(view["note"])  # 退回时明确展示要补的内容，同时保护草稿正文。
+                else:
+                    st.info("医生请你补充本次随访信息，当前没有可查看的具体意见。")
             # 仅在接口确实返回 content 时显示正文。发布前患者响应里没有这个字段。
             if "content" in view:
-                st.subheader("我的最终随访报告")
-                st.write("本次负责医生", report_doctor_label(view.get("responsible_doctor"),
-                                                        view.get("responsible_doctor_source")))
-                if view.get("reviewer"):
-                    st.caption("审核医生 · " + doctor_label(view["reviewer"]))
-                if view.get("reviewed_at"):
-                    st.caption("审核时间　" + view["reviewed_at"])
-                display_report(view["content"])
+                show_report_sheet(view, "我的最终随访报告")
+                # 窄屏默认收起侧栏，读完报告也能从正文下方回首页或就本次随访提问。
+                with st.container(horizontal=True):
+                    if st.button("就这份报告问助手", key="ask_published_report", icon=":material/chat:"):
+                        st.session_state["workspace"] = "assistant"  # 保留已授权的当前任务编号。
+                        st.rerun()
+                    if st.button("返回我的随访", key="report_back_home"):
+                        go_home()
             # 已通过但尚未发布时也走等待分支，医生仍需点击发布按钮。
             elif view["task_status"] == "in_review":
                 st.info("报告正在等待医生审核或发布。")
@@ -339,7 +408,12 @@ def show_report_workflow(token, task_id, doctor=False):
             return
         # 医生可以在报告旁核对同一个 record_id 的提交版本和原始读数。
         if view.get("record"):
-            with st.expander("本次提交的原始记录", expanded=True):
+            # 封面给出实际提交的血压；展开可逐项比对测量时间、症状、服药和原始提交版本。
+            record = view["record"]
+            heading = "本次提交的原始记录"
+            if record.get("systolic_bp") is not None and record.get("diastolic_bp") is not None:
+                heading += f"　·　血压 {record['systolic_bp']}/{record['diastolic_bp']} mmHg"
+            with st.expander(heading, expanded="content" not in view):
                 show_record(view["record"])  # 使用患者确认时的正式版本，中文展示原始信息。
         if "content" not in view:
             if view["task_status"] in EDITABLE_STATES:
@@ -347,12 +421,15 @@ def show_report_workflow(token, task_id, doctor=False):
             return  # 模型失败时仍可看原始记录、重新生成。
         report_states = {"pending_review": "待审核报告", "approved": "待发布报告",
                          "returned": "已退回的报告", "published": "已发布报告"}
-        st.subheader(report_states.get(view.get("status"), "随访报告"))
-        if view.get("reviewer"):
-            st.caption("审核医生　" + doctor_label(view["reviewer"]))
-        display_report(view["content"])
-        if view.get("note"):
-            st.write("已保存的审核意见", view["note"])
+        title = report_states.get(view.get("status"), "随访报告")
+        if view.get("status") not in ("pending_review", "approved"):
+            show_report_sheet(view, title)
+            return  # 已发布或已退回版本留作阅读，不绘制可提交的审核操作。
+        # 宽屏把决定区放在草稿旁，窄屏由 Streamlit 自动堆叠，先阅读再提交。
+        paper, decision = st.columns([2, 1], gap="medium")
+        with paper:
+            show_report_sheet(view, title)
+        panel = decision.container(key="report_review_actions", border=True)
         # expected_version 是打开此报告时读到的版本，不在页面自行加一。
         payload = {"report_id": view["report_id"], "expected_version": view["version"]}
         # key 包含账号、报告和版本。换患者或另一位医生登录时，不能沿用之前的审核输入。
@@ -360,14 +437,15 @@ def show_report_workflow(token, task_id, doctor=False):
         if view["status"] == "pending_review":
             # 四种动作中的前三种用于审核；发布只会在服务端返回 approved 后出现。
             options = {"通过": "approve", "修改后通过": "edit", "退回补充": "return"}
-            choice = st.radio("审核操作", list(options), key="choice_" + key)
+            panel.subheader("审核决定")
+            choice = panel.radio("审核操作", list(options), key="choice_" + key)
             payload["action"] = options[choice]  # 例如“退回补充”提交给 API 的 action 是 return。
             if choice == "修改后通过":
                 # 编辑器初值取数据库内原摘要，医生可直接更正和补充本次情况。
-                payload["summary"] = st.text_area("修改后的摘要", view["content"]["summary"],
+                payload["summary"] = panel.text_area("修改后的摘要", view["content"]["summary"],
                                                   max_chars=8000, key="summary_" + key)
                 # 一行代表一个关注项；写回列表保留条目界限，空行会略过。
-                points = st.text_area("需关注情况（每行一项）", "\n".join(view["content"]["abnormal_points"]),
+                points = panel.text_area("需关注情况（每行一项）", "\n".join(view["content"]["abnormal_points"]),
                                       key="points_" + key)
                 payload["abnormal_points"] = []
                 for line in points.splitlines():
@@ -375,22 +453,53 @@ def show_report_workflow(token, task_id, doctor=False):
                         payload["abnormal_points"].append(line.strip())
                 payload["keep_sources"] = []  # 保留建议及其对应引用一起提交，不能改写知识库原文。
                 for number, source in enumerate(view["content"]["sources"], 1):
-                    if st.checkbox(f"保留建议〔{number}〕 {source['quote']}", value=True,
+                    if panel.checkbox(f"保留建议〔{number}〕 {source['quote']}", value=True,
                                    key=f"keep_{key}_{number}"):
                         payload["keep_sources"].append(number)
-            payload["note"] = st.text_area("审核意见（退回时请写明需要补充什么）",
-                                           max_chars=2000, key="note_" + key)
-            if st.button("确认审核", key="review_" + key, type="primary"):
+            note_label = "给患者的审核意见（选填）"
+            button_label = "确认通过"
+            if choice == "退回补充":
+                note_label = "请写明需要患者补充什么（必填）"
+                button_label = "退回给患者补充"
+            elif choice == "修改后通过":
+                button_label = "保存修改并通过"
+            payload["note"] = panel.text_area(note_label, max_chars=2000, key="note_" + key)
+            if panel.button(button_label, key="review_" + key, type="primary", width="stretch"):
+                # 必填项留空时在决定区提示，保留其他填写内容，不发送无效审核。
+                if choice == "退回补充" and not payload["note"].strip():
+                    panel.warning("请先填写需要患者补充的内容。")
+                    return
+                if choice == "修改后通过" and not payload["summary"].strip():
+                    panel.warning("请先填写修改后的摘要。")
+                    return
                 request_api("POST", path + "/review", token=token, data=payload)
                 st.rerun()
         elif view["status"] == "approved":
-            st.info("审核已通过，发布后患者即可查看。")
-            if st.button("发布给患者", key="publish_" + key, type="primary"):
+            panel.subheader("发布报告")
+            panel.write("审核已通过，发布后患者即可查看。")
+            if panel.button("发布给患者", key="publish_" + key, type="primary", width="stretch"):
                 payload["action"] = "publish"
                 request_api("POST", path + "/review", token=token, data=payload)
                 st.rerun()
     except requests.RequestException as error:
         show_request_error(error)  # 保留可修改的输入；409 时刷新版本，503 时可重新生成。
+
+
+def show_saved_draft_summary(data):
+    """显示当前已保存的核对单，供患者提交前逐项核对；空字段不补写，不访问网络或数据库。"""
+    values = draft_display_values(data)  # 与手工输入框使用完全相同的选项和读数。
+    pressure = values["bp_measurement_status"]
+    if values["systolic_bp"] or values["diastolic_bp"]:
+        pressure = f"{values['systolic_bp'] or '—'} / {values['diastolic_bp'] or '—'} mmHg"
+    with st.container(border=True, key="saved_draft_summary"):
+        st.markdown("**请核对本次随访信息**")
+        lines = ["血压　" + pressure]
+        for key, label in (("measured_at", "测量时间"), ("symptoms", "身体情况"),
+                           ("medication_adherence", "服药情况"), ("missed_dose_reason", "漏服原因"),
+                           ("adverse_effects", "服药后感受")):
+            if values[key]:
+                lines.append(label + "　" + values[key])  # 按原文展示患者已确认前的描述。
+        st.text("\n".join(lines))
 
 
 def show_patient_draft(token, task_id):
@@ -452,13 +561,20 @@ def show_patient_draft(token, task_id):
         st.warning("草稿已有更新，当前输入仍保留。请先核对，再放弃当前修改并重新加载，避免覆盖新内容。")
     if draft_has_changes():
         st.caption("当前有尚未保存的修改。可以先问助手，回到这里继续；采集和提交前请先保存。")
-    # 从采集对话转到这张核对单时，显示同一版本，完整后可以直接核对提交。
-    with st.expander("核对随访信息 · 手工修改或确认提交", expanded=not latest["missing_fields"] or draft_has_changes()):
+    # 已经齐全时先呈现可读的摘要；只有需要修正时才展开整张表单。
+    ready = not latest["missing_fields"]
+    if ready:
+        show_saved_draft_summary(latest["data"])
+    elif latest["revision"]:
+        # 恢复部分草稿时，患者不用展开整张表格就能知道还要告诉助手哪些信息。
+        st.write("还需补充　" + "、".join(latest["missing_fields"]))
+    with st.expander("核对随访信息 · 手工填写或修改", expanded=draft_has_changes()):
         st.caption("还没说到的信息可以留空。修改后请先保存，再确认提交。")
-        if st.button("放弃当前修改并重新加载", key="draft_discard"):
+        can_discard = draft_has_changes() or latest["revision"] != base["revision"]
+        if can_discard and st.button("放弃当前修改并重新加载", key="draft_discard"):
             load_draft_fields(latest)  # 用户已明确选择放弃，才替换输入及版本。
             st.rerun()
-        if latest["missing_fields"]:
+        if latest["missing_fields"] and not latest["revision"]:
             # 缺项由服务器按“已测量”“有漏服”等条件计算，页面直接列给患者。
             st.write("已保存草稿还需补充：" + "、".join(latest["missing_fields"]))
         editable = latest["editable"]  # 即使控件不可编辑，后端保存接口仍要独立校验状态。
@@ -507,7 +623,10 @@ def show_patient_draft(token, task_id):
                 st.session_state["draft_reload"] = True  # 下一轮控件创建前再更新，避免修改已创建的控件。
                 st.session_state["draft_saved_notice"] = True
                 st.rerun()
-        show_patient_submit(token, task_id, latest, base)  # 提交与保存草稿是两个明确的操作。
+        if not ready:
+            show_patient_submit(token, task_id, latest, base)  # 缺项时在编辑区说明提交条件。
+    if ready:
+        show_patient_submit(token, task_id, latest, base)  # 齐全后直接在摘要下方确认，仍需勾选。
 
 
 
@@ -761,6 +880,21 @@ def task_doctor(task):
                          "title": task.get("doctor_title")})
 
 
+def show_contact_phone(phone):
+    """显示详情接口提供的号码，支持复制及拨号。空号显示登记状态；不请求网络或写库。"""
+    number = (phone or "").strip()  # 保留区号、空格等登记格式，复制时与档案一致。
+    if not number:
+        st.caption("暂未登记联系电话")
+        return
+    with st.container(horizontal=True, vertical_alignment="center"):
+        # Streamlit 的代码框自带复制按钮；整行号码也能直接选中复制。
+        st.code(number, language=None, width=210, wrap_lines=True)
+        dial_number = re.sub(r"[\s()（）-]", "", number)
+        if re.fullmatch(r"\+?[0-9]+", dial_number):
+            # 点击后由设备的电话应用接管；含有分机说明等文字的原始号码仍能复制。
+            st.link_button("拨打电话", "tel:" + dial_number, icon=":material/call:")
+
+
 def report_doctor_label(doctor, source):
     """根据报告署名来源显示医生。缺少历史依据时返回说明，不猜测当次负责人。"""
     if source == "unverified":
@@ -861,7 +995,9 @@ def task_action(task):
 def task_priority(task):
     """给患者首页排序，先补充退回资料，再继续草稿或开始最近任务；只返回排序键。"""
     rank = 3
-    if task["task_status"] == "needs_info":
+    if task.get("is_overdue"):
+        rank = -1  # 超过本次时限仍可补交，优先展示。
+    elif task["task_status"] == "needs_info":
         rank = 0
     elif task["task_status"] in EDITABLE_STATES:
         rank = 2
@@ -870,15 +1006,42 @@ def task_priority(task):
     return rank, task.get("followup_date") or "", task["task_id"]
 
 
-def task_card(token, task, primary=False, doctor=False):
-    """显示一项随访与对应操作；用户点击后才请求任务详情。"""
-    with st.container(border=True):
-        description, action = st.columns([3, 1])
+def task_state_label(task):
+    """输入授权任务摘要，返回页面状态文字；计划时间与审核进度分别判断，只读内存。"""
+    if task.get("scheduled_at") and not task.get("opened_at"):
+        return "待开放"
+    if task.get("is_overdue"):
+        return "已逾期，仍可补交"
+    return TASK_STATES.get(task["task_status"], "状态待确认")
+
+
+def task_card(token, task, primary=False, doctor=False, notice=None):
+    """用授权任务和可选提醒生成操作卡；点击才请求详情，失败留在当前页，不写库。"""
+    card_key = "followup_item_" + task["task_id"]
+    if primary:
+        card_key = "primary_task_" + task["task_id"]  # 当前最需要处理的一项使用独立视觉重点。
+    with st.container(border=True, key=card_key):
+        description, action = st.columns([3, 1], vertical_alignment="center")
         with description:
-            st.markdown("**" + task_name(task) + "**")
-            st.caption(f"{task['followup_date']}　·　{TASK_STATES.get(task['task_status'], '状态待确认')}")
+            title = task_name(task)
+            if doctor and task.get("patient_name"):
+                title = task["patient_name"] + " · " + title  # 在跨患者待办列表中先识别人。
+            st.markdown("**" + title + "**")
+            status_label = task_state_label(task)
+            color = "blue"
+            if task.get("is_overdue") or task["task_status"] == "needs_info":
+                color = "orange"
+            elif task["task_status"] == "completed":
+                color = "green"
+            st.caption(f":{color}-badge[{status_label}]　{task['followup_date']}")
+            if task.get("scheduled_at"):
+                if not task.get("opened_at"):
+                    st.write("预计开放　" + task["scheduled_at"] + "（北京时间）")
+                elif task["task_status"] in EDITABLE_STATES:
+                    st.write("填写截止　" + task["expires_at"] + "（北京时间）")
+            if notice:
+                st.info(notice["message"], icon=":material/notifications:")
             if doctor:
-                st.write(task.get("patient_name") or "随访任务")
                 if task.get("report_status") == "approved":
                     st.caption("审核已通过，等待发布给患者。")
             elif task.get("report_status") == "published":
@@ -887,7 +1050,8 @@ def task_card(token, task, primary=False, doctor=False):
                 st.write("本次负责医生　" + task_doctor(task))
             if task["task_status"] == "needs_info":
                 if task.get("review_note"):
-                    st.write("医生请你补充", task["review_note"])
+                    label = "已请患者补充" if doctor else "医生请你补充"
+                    st.write(label, task["review_note"])  # 两端看到同一条意见，按阅读者身份称呼。
                 else:
                     st.caption("本次随访需要补充，目前没有可查看的具体意见。")
             elif not doctor and task["task_status"] in ("submitted", "in_review"):
@@ -906,27 +1070,45 @@ def task_card(token, task, primary=False, doctor=False):
                 st.caption("报告日期　" + task["report_date"])
         with action:
             label = task_action(task)
+            if task.get("is_overdue"):
+                label = "继续补交"
             if doctor:
-                label = "查看本次随访"
-                if task.get("report_status") == "pending_review":
-                    label = "审核报告"
-                elif task.get("report_status") == "approved":
-                    label = "前往发布"
-                elif task["task_status"] == "submitted":
-                    label = "查看生成进度"
+                label = doctor_task_action(task)
             style = "secondary"
             if primary:
                 style = "primary"
-            if st.button(label, key="enter_task_" + task["task_id"], type=style):
+            if st.button(label, key="enter_task_" + task["task_id"], type=style, width="stretch"):
                 open_task(token, task["task_id"])
 
 
+def doctor_task_action(task):
+    """输入医生有权查看的任务，返回与当前报告状态相符的按钮文字；只读内存。"""
+    if task.get("report_status") == "pending_review":
+        return "审核报告"
+    if task.get("report_status") == "approved":
+        return "前往发布"
+    if task["task_status"] == "submitted":
+        return "查看生成进度"
+    if task.get("report_status") == "published":
+        return "阅读报告"
+    return "查看本次随访"
+
+
+@st.fragment(run_every="60s")
 def show_patient_home(token):
-    """读取本人档案与任务；首页突出当前动作，按日期另列已发布报告。"""
+    """用 token 读取本人随访和主管医生联系方式；请求失败会提示，可继续查看其余已授权资料。"""
     st.title("我的随访")
+    next_step = st.container()  # 把当前任务放在联系卡之前，手机上进入首页也先看到可执行的操作。
     profiles = get_view(token, "/patients")
     if profiles:
-        st.write("主管医生　" + doctor_label(profiles[0].get("primary_doctor")))
+        # 名单不带电话，只有当前账号能打开的档案详情才返回主管医生的联系资料。
+        detail = get_view(token, "/patients/" + profiles[0]["patient_id"])
+        if detail:
+            primary_doctor = detail["patient"].get("primary_doctor")
+            with st.container(key="workspace_contact_primary"):
+                st.write("主管医生　" + doctor_label(primary_doctor))
+                if primary_doctor:
+                    show_contact_phone(primary_doctor.get("phone"))
     elif profiles == []:
         st.caption("该账号尚未关联患者档案。")
     tasks = get_view(token, "/tasks")
@@ -943,25 +1125,41 @@ def show_patient_home(token):
         else:
             upcoming.append(task)
     upcoming.sort(key=task_priority)
-    st.subheader("下一步")
-    if upcoming:
-        task_card(token, upcoming[0], primary=True)
-        if len(upcoming) > 1:
-            with st.expander("其他随访安排", expanded=False):
-                for task in upcoming[1:]:
-                    task_card(token, task)
-    elif tasks:
-        st.info("当前随访均已完成，可以阅读下方的报告。")
-    else:
-        st.info("目前没有随访安排。你也可以从侧栏问助手。")
-    st.subheader("历次随访报告")
-    if not reports:
-        st.caption("医生发布后，可在这里阅读报告。")
-    # 按报告日期倒序；旧报告缺少日期时，使用本次随访日期。
+    # 只在首页轮询，保持已打开页面的提醒更新，患者手工编辑草稿时不会被计时刷新打断。
+    notices = get_view(token, "/notifications/schedule")
+    notices_by_task = {}
+    for notice in notices or []:
+        notices_by_task[notice["task_id"]] = notice
+    # 先按报告日期定位最新一份，没有待填任务时可直接打开。
     def report_order(task):
-        """输入任务摘要，返回历史报告排序日期。"""
+        """输入报告摘要，返回排序日期；旧报告缺少发布日期时使用随访日期。"""
         return task.get("report_date") or task.get("followup_date") or ""
-    for task in sorted(reports, key=report_order, reverse=True):
+    reports.sort(key=report_order, reverse=True)
+    if upcoming:
+        with next_step:
+            st.subheader("下一步")
+            task_card(token, upcoming[0], primary=True, notice=notices_by_task.get(upcoming[0]["task_id"]))
+            if len(upcoming) > 1:
+                with st.expander("其他随访安排", expanded=False):
+                    for task in upcoming[1:]:
+                        task_card(token, task, notice=notices_by_task.get(task["task_id"]))
+    elif reports:
+        with next_step:
+            st.subheader("最新随访报告")
+            task_card(token, reports.pop(0), primary=True)  # 下方历史列表只渲染其余报告，避免重复按钮。
+    else:
+        with next_step:
+            st.subheader("下一步")
+            if closed:
+                st.info("当前随访已结束，暂无已发布报告。")
+            else:
+                st.info("目前没有随访安排。")
+            if st.button("问随访助手", key="empty_home_assistant", type="primary", icon=":material/chat_bubble_outline:"):
+                st.session_state["workspace"] = "assistant"  # 从空首页进入普通查询，不绑定任务。
+                st.rerun()
+    if reports:
+        st.subheader("历次随访报告")
+    for task in reports:
         task_card(token, task)
     if closed:
         with st.expander("其他已结束的随访"):
@@ -977,10 +1175,27 @@ def open_patient(patient_id):
     st.rerun()
 
 
+@st.fragment(run_every="60s")
 def show_physician_home(token):
-    """显示授权名册、待办和风险通知；当前栏目独立读取，失败可以切换其他栏目。"""
+    """按登录凭证读取名册、待办或通知；可从相关患者行进入当次随访。失败可重新加载，不写库。"""
     st.title("医生工作台")
-    section = st.radio("工作台栏目", ["我的患者", "待办随访", "风险通知"], horizontal=True, key="doctor_section")
+    section = st.radio("工作台栏目", ["我的患者", "待办随访", "随访提醒", "风险通知"], horizontal=True, key="doctor_section")
+    if section == "随访提醒":
+        # 只列未提交的当次逾期事项；患者补交后，后端会将这条提醒移出待办。
+        notices = get_view(token, "/notifications/schedule")
+        if notices == []:
+            st.info("当前没有逾期待联系的患者。")
+        for notice in notices or []:
+            with st.container(border=True):
+                st.write(notice["patient_name"])
+                st.warning(notice["message"])
+                st.caption("提醒时间　" + notice["created_at"] + "（北京时间）")
+                with st.container(horizontal=True):
+                    if st.button("联系患者", key="contact_overdue_" + notice["task_id"]):
+                        open_patient(notice["patient_id"])
+                    if st.button("查看本次随访", key="overdue_task_" + notice["task_id"]):
+                        open_task(token, notice["task_id"])
+        return
     if section == "待办随访":
         tasks = get_view(token, "/tasks")
         if tasks is None:
@@ -989,7 +1204,7 @@ def show_physician_home(token):
         for task in tasks:
             if task["task_status"] in ("submitted", "in_review"):
                 count += 1
-                task_card(token, task, doctor=True)
+                task_card(token, task, primary=count == 1, doctor=True)
         if not count:
             st.info("当前没有待处理的随访。")
         return
@@ -1010,25 +1225,37 @@ def show_physician_home(token):
     patients = get_view(token, "/patients")
     if patients is None:
         return
+    # 名册先提供“哪位患者需要我处理”的汇总；只有确有待办时，才另读授权任务以生成直达按钮。
+    review_count = 0
+    for patient in patients:
+        if patient.get("has_review"):
+            review_count += 1
+    st.caption(f"关联患者 {len(patients)} 位　·　待我处理 {review_count} 位")
+    review_tasks = {}
+    if review_count:
+        for task in get_view(token, "/tasks") or []:
+            if task["task_status"] in ("submitted", "in_review") and task.get("patient_id"):
+                review_tasks.setdefault(task["patient_id"], []).append(task)
     search_col, filter_col = st.columns([1, 2])
     search = search_col.text_input("搜索患者姓名", key="patient_search").strip()
-    categories = ["全部", "待我处理", "待患者填写", "已完成随访", "暂无任务"]
+    categories = ["全部", "待我处理", "逾期待联系", "待患者填写", "待开放", "已完成随访", "暂无任务"]
     category = filter_col.selectbox("按随访状态筛选", categories, key="patient_filter")
-    flags = {"待我处理": "has_review", "待患者填写": "has_to_fill", "已完成随访": "has_completed"}
+    flags = {"待我处理": "has_review", "逾期待联系": "has_overdue", "待患者填写": "has_to_fill",
+             "待开放": "has_scheduled", "已完成随访": "has_completed"}
     count = 0
     for patient in patients:
         if search and search not in patient["patient_name"]:
             continue
-        if category in flags and not patient[flags[category]]:
+        if category in flags and not patient.get(flags[category]):
             continue
         if category == "暂无任务" and patient["task_count"]:
             continue
         count += 1
-        with st.container(border=True):
-            summary, status = st.columns([3, 2])
+        with st.container(border=True, key="roster_row_" + patient["patient_id"]):
+            summary, status = st.columns([3, 2], vertical_alignment="center")
             # 姓名按钮用稳定患者编号作 key；同名不会打开对方的档案。
             if summary.button(patient["patient_name"], key="patient_" + patient["patient_id"],
-                              help="打开患者档案", icon=":material/person:"):
+                              help="打开患者档案", type="tertiary", icon=":material/person:"):
                 open_patient(patient["patient_id"])
             # 一位患者可由多位医生分次随访；说明当前登录医生为什么能查看此人。
             relation = "我负责其中的随访"
@@ -1037,11 +1264,19 @@ def show_physician_home(token):
             summary.caption(relation + "　·　" + patient_summary(patient))
             states = []
             for title, flag in flags.items():
-                if patient[flag]:
+                if patient.get(flag):
                     states.append(title)
             status.write(" · ".join(states) or "暂无任务")
             if patient.get("latest_followup_date"):
                 status.caption("最近随访安排　" + patient["latest_followup_date"])
+            pending = review_tasks.get(patient["patient_id"], [])
+            if len(pending) == 1:
+                work = pending[0]  # 单次待办可直接进入这项任务，再由详情接口重查归属。
+                if status.button(doctor_task_action(work), key="roster_work_" + work["task_id"], type="primary"):
+                    open_task(token, work["task_id"])
+            elif pending:
+                if status.button(f"查看 {len(pending)} 项待办", key="roster_pending_" + patient["patient_id"], type="primary"):
+                    open_patient(patient["patient_id"])
     if not count:
         st.info("当前没有符合条件的患者。")
 
@@ -1100,11 +1335,22 @@ def show_patient_profile(token, detail):
     patient = detail["patient"]
     st.title(patient["patient_name"] + "的档案")
     st.write(patient_summary(patient))
+    # 医生从已授权档案联系当前患者。这里不使用医生或其他家庭成员的号码填空。
+    with st.container(key="workspace_contact_patient"):
+        st.write("患者联系电话")
+        show_contact_phone(patient.get("phone"))
     st.write("主管医生　" + doctor_label(patient.get("primary_doctor")))
     st.write("既往病史", patient.get("medical_history") or "未提供")
     st.subheader("随访安排与报告")
+    # 多次随访优先处理当前待办，再看其他任务；两组内保留接口提供的时间顺序。
+    pending, others = [], []
     for task in detail["tasks"]:
-        task_card(token, task, doctor=True)
+        if task["task_status"] in ("submitted", "in_review"):
+            pending.append(task)
+        else:
+            others.append(task)
+    for index, task in enumerate(pending + others):
+        task_card(token, task, primary=bool(pending) and index == 0, doctor=True)
     if not detail["tasks"]:
         st.caption("目前没有可查看的随访任务。")
     for title, rows in (("出院资料", detail["discharges"]), ("正式随访记录", detail["records"])):
@@ -1133,14 +1379,27 @@ def show_task_page(token, task, doctor):
     if doctor and task.get("patient_name"):
         title = task["patient_name"] + " · " + title
     st.title(title)
-    st.write(f"{task['followup_date']}　·　{TASK_STATES.get(task['task_status'], '状态待确认')}")
-    if task.get("report_status") != "published" or doctor:
+    st.caption(f"{task['followup_date']}　·　{task_state_label(task)}")
+    if doctor:
         st.caption("任务负责医生　" + task_doctor(task))
-    if task.get("expires_at"):
+    else:
+        # 联系卡使用当下任务分配；已发布报告中的历史署名由报告视图单独显示。
+        with st.container(horizontal=True, vertical_alignment="center", key="workspace_contact_task"):
+            st.write("当前随访负责医生　" + task_doctor(task))
+            with st.popover("联系医生", icon=":material/call:"):
+                show_contact_phone(task.get("doctor_phone"))  # 联系操作可就地打开，让出正文空间。
+    planned = task.get("scheduled_at") and not task.get("opened_at")
+    if planned:
+        st.info("预计 " + task["scheduled_at"] + "（北京时间）开放，开放后患者将收到站内提醒。")
+    elif task.get("scheduled_at") and task["task_status"] in EDITABLE_STATES:
+        st.caption("填写截止　" + task["expires_at"] + "（北京时间）")
+    elif not task.get("scheduled_at") and task.get("expires_at"):
         st.caption("截止时间　" + task["expires_at"])
     if doctor:
         if task.get("patient_id") and st.button("查看患者档案 · " + str(task.get("patient_name") or ""), key="task_patient"):
             open_patient(task["patient_id"])
+        if planned:
+            return  # 预排期间是医生只读计划，此时尚无可审核的内容。
         show_report_workflow(token, task["task_id"], doctor=True)
         return
     if st.session_state.pop("draft_submit_notice", None):
@@ -1155,7 +1414,12 @@ def show_task_page(token, task, doctor):
         show_patient_draft(token, task["task_id"])
         with conversation:
             if not st.session_state.get("message"):
-                st.caption("可以从最近一次血压测量说起。助手会把你说的内容整理到下方核对单。")
+                if status == "needs_info":
+                    st.caption("可以直接告诉助手医生要求补充的内容，也可以展开下方核对单手工修改。")
+                elif task.get("draft_revision"):
+                    st.caption("已恢复上次保存的草稿，可以接着填写或直接核对。")
+                else:
+                    st.caption("可以从最近一次血压测量说起。助手会把你说的内容整理到下方核对单。")
             show_chat(token, "collect", task_id=task["task_id"])
 
 # ==================== 页面上方固定内容 ====================
@@ -1163,18 +1427,39 @@ def show_task_page(token, task, doctor):
 remember_draft_edits()
 # 这几句每次脚本重跑都会执行。set_page_config 设置浏览器标签标题和图标，
 st.set_page_config(page_title="高血压随访助手", page_icon="🩺", layout="wide")
-# 仅设置布局与主要按钮的颜色，保留 Streamlit 对键盘、窄屏和深色模式的支持。
+# 表面和边框从当前 Streamlit 主题配色派生；患者、医生和报告共用同一套层级。
 st.html("""
 <style>
-    .stMainBlockContainer {max-width: 70rem; padding-top: 3rem;}
-    [data-testid="stSidebar"] h1 {font-size: 1.5rem;}
+    [data-testid="stAppViewContainer"], [data-testid="stApp"] {
+        --paper: var(--st-background-color, Canvas);
+        --line: color-mix(in srgb, var(--st-text-color, CanvasText) 15%, var(--paper));
+        background-color: color-mix(in srgb, var(--paper) 95%, #718e85);
+    }
+    .stMainBlockContainer {max-width: 72rem; padding: 3.5rem 2.25rem 4rem;}
+    [data-testid="stHeader"] {background: transparent;}
+    [data-testid="stAppDeployButton"] {display:none;}
+    [data-testid="stSidebar"] {border-inline-end: 1px solid var(--line);}
+    [data-testid="stSidebar"] h1 {font-size: 1.45rem;}
+    [data-testid="stMain"] h1 {font-size: clamp(1.85rem, 3vw, 2.65rem);letter-spacing: -.035em;}
+    [data-testid="stMain"] h2 {font-size: clamp(1.23rem, 2vw, 1.55rem);}
+    [class*="st-key-followup_item_"], [class*="st-key-roster_row_"],
+    [class*="st-key-primary_task_"], .st-key-report_review_actions, .st-key-login_panel, .st-key-saved_draft_summary {
+        background: var(--paper);border: 1px solid var(--line);border-radius: 14px;
+    }
+    [class*="st-key-primary_task_"], .st-key-login_panel {
+        border-top: 3px solid #368678;
+        box-shadow: 0 5px 20px rgb(22 58 51 / 6%);
+    }
+    .st-key-login_panel {padding: clamp(1.1rem, 3vw, 2rem);}
+    .st-key-login_panel h1 {font-size: clamp(1.65rem, 3vw, 2rem);}
+    .st-key-saved_draft_summary pre {font-family: inherit; white-space: pre-wrap; line-height: 1.75;}
     [data-testid="stBaseButton-primary"], [data-testid="stBaseButton-primaryFormSubmit"] {
-        background-color: #176c62; border-color: #176c62; color: white;
+        background-color: #16695e; border-color: #16695e; color: white;
     }
     [data-testid="stBaseButton-primary"]:hover, [data-testid="stBaseButton-primaryFormSubmit"]:hover {
         background-color: #12584f; border-color: #12584f; color: white;
     }
-    @media (max-width: 700px) { .stMainBlockContainer {padding-top: 2rem;} }
+    @media (max-width: 700px) { .stMainBlockContainer {padding: 3.4rem 1rem 3rem;} }
 </style>
 """)
 
@@ -1184,15 +1469,15 @@ if not st.session_state.get("token"):
     clear_login()  # 清理已失效的身份、选择和历史，避免账号之间混用页面内容。
     # 宽屏登录框保持舒适行宽，小屏自动收缩到可用宽度。
     with st.container(horizontal_alignment="center"):
-        with st.container(width=480):
+        with st.container(width=480, border=True, key="login_panel"):
             st.title("高血压随访助手")
-            st.subheader("登录")
-            with st.form("login_form"):
+            st.caption("患者在这里填写随访、阅读报告。医生登录后可查看患者和审核随访。")
+            with st.form("login_form", border=False):
                 # 选择身份只表明想进入哪个工作区；后端会再次验证实际账号角色。
                 identity = st.radio("登录身份", ["患者", "医生"], horizontal=True)
                 name = st.text_input("姓名", max_chars=64)
                 password = st.text_input("密码", type="password", max_chars=128)
-                submitted = st.form_submit_button("登录", type="primary")
+                submitted = st.form_submit_button("登录", type="primary", width="stretch")
 
     if submitted:
         if not name.strip() or not password:

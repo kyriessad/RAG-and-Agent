@@ -1,5 +1,6 @@
 """随访采集草稿：校验字段、检查任务归属，并读写已有的 task_drafts 表。"""
 
+import hashlib
 import json
 import sqlite3
 from typing import Literal  # 固定选项同时生成工具和接口的字段说明。
@@ -130,6 +131,7 @@ def require_patient_task(conn, user_id, role, task_id):
     """用当前连接核对患者、任务及实时角色，返回状态；越权或不存在均抛 PermissionError。
 
     调用方已开启事务，因此归属检查与草稿读写处在同一数据库快照中。
+    自动排期只有实际开放后才可填；已有任务按原归属读取，逾期也保留补交权限。
     """
     if role != "patient":  # 医生不能通过此患者接口查看或修改未确认的采集草稿。
         raise PermissionError("任务不存在或无权访问。")
@@ -138,7 +140,8 @@ def require_patient_task(conn, user_id, role, task_id):
            JOIN discharges AS d ON d.discharge_id = t.discharge_id
            JOIN patients AS p ON p.patient_id = d.patient_id
            JOIN users AS u ON u.user_id = p.user_id
-           WHERE t.task_id = ? AND p.user_id = ? AND u.role = 'patient'""",
+           WHERE t.task_id = ? AND p.user_id = ? AND u.role = 'patient'
+             AND (t.scheduled_at IS NULL OR t.opened_at IS NOT NULL)""",
         (task_id, user_id),  # 参数绑定，不把患者输入拼接到 SQL。
     ).fetchone()
     if row is None:
@@ -146,11 +149,18 @@ def require_patient_task(conn, user_id, role, task_id):
     return row["task_status"]
 
 
+def confirmed_record_id(task_id, draft_revision):
+    """由任务编号和已保存的草稿版本计算正式记录编号；与历次提交共用同一算法，不读写库。"""
+    identity = f"{task_id}|{draft_revision}"  # 同一版本重新提交只会找到同一个编号。
+    return "FR_" + hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+
 def read_draft(conn, task_id, task_status):
     """在已授权的连接上读取草稿，返回接口字典；不存在返回版本 0，不创建记录。
 
     已知旧字段在内存中兼容，不改原记录；未知或损坏格式仍抛数据库错误。
-    同时返回当前字段的规则结果和历史提醒，读取本身不会生成新通知。
+    同时返回当前字段的规则结果、历史提醒和 returned_draft 标记。
+    returned_draft=True 表示医生退回的正是本草稿版本，须先补充保存才能重新确认。
     """
     row = conn.execute("SELECT draft_json, revision FROM task_drafts WHERE task_id = ?", (task_id,)).fetchone()
     revision = 0  # 尚未保存的页面草稿以版本 0 表示。
@@ -163,7 +173,21 @@ def read_draft(conn, task_id, task_status):
             revision = row["revision"]
         except ValueError as error:
             raise sqlite3.DatabaseError("已有草稿格式无法读取，请检查后端记录。") from error
-    return {"task_id": task_id, "revision": revision, "data": data,
+    returned_draft = False  # 只有医生已退回且当前草稿正是上次提交版本时，才要求先保存补充。
+    if task_status == "needs_info" and row is not None:
+        previous = conn.execute(
+            """SELECT record_id, CASE WHEN json_valid(data_json) THEN
+                       CASE WHEN json_type(data_json,'$._submission.draft_revision')='integer'
+                            THEN json_extract(data_json,'$._submission.draft_revision') END
+                       END AS draft_revision
+               FROM followup_records WHERE task_id=?
+               ORDER BY revision DESC, submitted_at DESC, record_id DESC LIMIT 1""", (task_id,),
+        ).fetchone()  # 老记录可能没有可靠的草稿版本，不能用正式记录的 revision 推断。
+        returned_draft = previous is not None and previous["draft_revision"] == revision
+        if previous is not None and previous["draft_revision"] is None:
+            # 缺快照时只接受正式提交接口可验证的稳定编号，其余旧编号保留原提交流程。
+            returned_draft = previous["record_id"] == confirmed_record_id(task_id, revision)
+    return {"task_id": task_id, "revision": revision, "data": data, "returned_draft": returned_draft,
             "missing_fields": missing_draft_fields(data),
             "notes": stored_draft_notes(stored, data),  # 旧服药布尔值需要患者再次确认。
             "risk": evaluate_risk(data=data),  # 只读规则结果；缺项不判成安全。
@@ -222,7 +246,7 @@ def save_task_draft(user_id, role, task_id, expected_revision, data):
         save_risk_notification(conn, user_id, task_id, risk, "采集草稿，尚未经确认提交")
         alerts = list_task_risk_alerts(conn, task_id)  # 查询本事务刚写入的通知，随草稿一起交给页面。
         conn.commit()  # 草稿与必要通知一起保存；不改变 followup_tasks/followup_records。
-        return {"task_id": task_id, "revision": revision, "data": data,
+        return {"task_id": task_id, "revision": revision, "data": data, "returned_draft": False,
                 "missing_fields": missing, "notes": stored_draft_notes(stored, data), "editable": True,
                 "risk": risk, "alerts": alerts}
     except Exception:

@@ -3,6 +3,7 @@
 from contextlib import closing
 import json
 
+from utils import schedule_store
 from utils.user_store import get_connection
 
 
@@ -12,13 +13,18 @@ MY_TASKS = """
 WITH my_tasks AS (
     SELECT t.*, p.patient_id, p.name AS patient_name,
            doctor.name AS doctor_name, doctor.department AS doctor_department,
-           doctor.title AS doctor_title
+           doctor.title AS doctor_title,
+           -- 首轮实际开放后才开始计时；提交即结束患者本轮待办，退回时重算截止时间。
+           CASE WHEN t.scheduled_at IS NOT NULL AND t.opened_at IS NOT NULL
+                     AND t.task_status IN ('pending','in_progress','needs_info')
+                     AND t.expires_at <= :now THEN 1 ELSE 0 END AS is_overdue
     FROM followup_tasks t
     JOIN discharges h ON h.discharge_id=t.discharge_id
     JOIN patients p ON p.patient_id=h.patient_id
     JOIN doctors doctor ON doctor.doctor_id=t.doctor_id
     JOIN users u ON u.user_id=:user_id AND u.role=:role
-    WHERE ((u.role='patient' AND p.user_id=u.user_id)
+    WHERE ((u.role='patient' AND p.user_id=u.user_id
+              AND (t.scheduled_at IS NULL OR t.opened_at IS NOT NULL))
         OR (u.role='doctor' AND doctor.user_id=u.user_id))
       AND (:task_id IS NULL OR t.task_id=:task_id)
       AND (:patient_id IS NULL OR p.patient_id=:patient_id)
@@ -28,12 +34,16 @@ WITH my_tasks AS (
 # 只找最新正式记录对应的报告，重交之后不会把上次的退回意见当成本次的处理结果。
 TASK_DETAILS = """
 SELECT t.task_id,t.discharge_id,t.followup_date,t.task_type,t.task_status,t.expires_at,
+       t.scheduled_at,t.opened_at,t.window_revision,t.is_overdue,
        t.patient_id,t.patient_name,t.doctor_id,t.doctor_name,t.doctor_department,t.doctor_title,
        COALESCE(g.revision,0) AS draft_revision,g.needs_clarification AS draft_needs_clarification,
-       r.submitted_at,
+       -- SQLite 自动登记提交/生成时间时使用 UTC，新排期任务在页面上统一与北京时间截止点对照。
+       CASE WHEN t.scheduled_at IS NOT NULL THEN datetime(r.submitted_at,'+8 hours')
+            ELSE r.submitted_at END AS submitted_at,
        CASE WHEN b.status='returned' AND t.task_status='needs_info' THEN b.review_note END AS review_note,
        CASE WHEN :role='doctor' OR (b.status='published' AND t.task_status='completed')
-            THEN b.created_at END AS report_date,
+            THEN CASE WHEN t.scheduled_at IS NOT NULL THEN datetime(b.created_at,'+8 hours')
+                      ELSE b.created_at END END AS report_date,
        CASE WHEN :role='doctor' THEN b.status
             WHEN b.status='published' AND t.task_status='completed' THEN 'published' END AS report_status,
        CASE WHEN b.status='published' AND t.task_status='completed'
@@ -65,7 +75,9 @@ ORDER BY d.discharge_date DESC,d.discharge_id
 # 同一次任务多次提交分别列出。工具只读最近的记录，选中患者的完整档案读取该范围的全部历史。
 RECORDS = """
 SELECT r.record_id,r.task_id,r.bp_measurement_status,r.systolic_bp,r.diastolic_bp,r.heart_rate,
-       r.symptoms,r.medication_adherence,r.submitted_at,r.revision,t.patient_id,t.patient_name
+       r.symptoms,r.medication_adherence,
+       CASE WHEN t.scheduled_at IS NOT NULL THEN datetime(r.submitted_at,'+8 hours')
+            ELSE r.submitted_at END AS submitted_at,r.revision,t.patient_id,t.patient_name
 FROM my_tasks t
 JOIN followup_records r ON r.task_id=t.task_id
 ORDER BY r.submitted_at DESC,r.revision DESC,r.record_id DESC
@@ -80,7 +92,10 @@ SELECT p.patient_id,p.name AS patient_name,p.age,p.gender,p.diagnosis,p.medical_
        CASE WHEN primary_doc.user_id=u.user_id AND u.role='doctor' THEN 1 ELSE 0 END AS is_primary,
        COUNT(t.task_id) AS task_count,MAX(t.followup_date) AS latest_followup_date,
        MAX(CASE WHEN t.task_status IN ('submitted','in_review') THEN 1 ELSE 0 END) AS has_review,
-       MAX(CASE WHEN t.task_status IN ('pending','in_progress','needs_info') THEN 1 ELSE 0 END) AS has_to_fill,
+       MAX(CASE WHEN t.task_status IN ('pending','in_progress','needs_info')
+                 AND (t.scheduled_at IS NULL OR t.opened_at IS NOT NULL) THEN 1 ELSE 0 END) AS has_to_fill,
+       MAX(CASE WHEN t.scheduled_at IS NOT NULL AND t.opened_at IS NULL THEN 1 ELSE 0 END) AS has_scheduled,
+       COALESCE(MAX(t.is_overdue),0) AS has_overdue,
        MAX(CASE WHEN t.task_status='completed' THEN 1 ELSE 0 END) AS has_completed
 FROM patients p
 JOIN users u ON u.user_id=:user_id AND u.role=:role
@@ -104,6 +119,8 @@ def query_rows(conn, sql, user_id, role, task_id, patient_id):
         raise PermissionError("当前账号不能查询医疗资料。")
     # 身份来自后端，选择编号来自页面或服务端工具上下文，不能覆盖身份。
     params = {"user_id": user_id, "role": role, "task_id": task_id, "patient_id": patient_id}
+    # 截止时刻和排期服务使用同一北京时间，测试可把时钟固定在开放或逾期的边界。
+    params["now"] = schedule_store.beijing_time_text()
     rows = conn.execute(MY_TASKS + sql, params).fetchall()
     items = []
     for row in rows:
@@ -136,6 +153,7 @@ def task_summaries(conn, user_id, role, task_id, patient_id):
     """输入连接、身份和可选范围；返回任务列表及已发布报告的负责医生，不返回报告正文。"""
     tasks = query_rows(conn, TASK_DETAILS, user_id, role, task_id, patient_id)
     for task in tasks:
+        task["is_overdue"] = bool(task["is_overdue"])  # 接口返回布尔值，任务原有状态仍独立保留。
         saved = task.pop("doctor_snapshot")  # 临时 SQL 字段不直接作为接口内容。
         reviewer_id = task.pop("signed_by")
         task["report_doctor"] = None
@@ -159,12 +177,35 @@ def list_followup_tasks(user_id: str, role: str, task_id=None, patient_id=None) 
         return task_summaries(conn, user_id, role, task_id, patient_id)
 
 
-def get_followup_task(user_id: str, role: str, task_id: str) -> dict | None:
-    """只读指定任务。输入服务端身份和任务编号，无权和不存在均返回 None。"""
-    tasks = list_followup_tasks(user_id, role, task_id)
-    if not tasks:
+def contact_phone(conn, person_role, person_id):
+    """在当前只读事务里按已获准的人员编号取电话；空号返回 None，角色错误抛 ValueError。"""
+    # 联系人编号取自同一事务刚查出的授权档案或任务，不能直接使用页面传来的编号。
+    if person_role == "doctor":
+        sql = "SELECT phone FROM doctors WHERE doctor_id=?"
+    elif person_role == "patient":
+        sql = "SELECT phone FROM patients WHERE patient_id=?"
+    else:
+        raise ValueError("未知的联系人角色。")
+    row = conn.execute(sql, (person_id,)).fetchone()  # 只取需要展示的一位联系人。
+    if row is None or not row["phone"]:
         return None
-    return tasks[0]  # 已按主键筛选，至多一项。
+    return row["phone"].strip() or None  # 只录入了空格的号码也视为尚未登记。
+
+
+def get_followup_task(user_id: str, role: str, task_id: str, *, include_contact=False) -> dict | None:
+    """输入后端身份和任务编号，返回授权任务字典；无权或不存在返回 None，只读数据库。
+
+    患者打开任务详情时 include_contact=True，结果另含本次负责医生的 doctor_phone。
+    """
+    with closing(get_connection()) as conn:
+        conn.execute("BEGIN")  # 同一快照内确认任务归属和负责医生，避免改派期间混用两次查询。
+        tasks = task_summaries(conn, user_id, role, task_id, None)
+        if not tasks:
+            return None  # 没有可访问的任务就没有联系人。
+        task = tasks[0]  # 主键限定了至多一项。
+        if include_contact and role == "patient":
+            task["doctor_phone"] = contact_phone(conn, "doctor", task["doctor_id"])
+        return task
 
 
 def list_discharges(user_id: str, role: str, task_id=None, patient_id=None) -> list[dict]:
@@ -190,7 +231,7 @@ def patient_profiles(conn, user_id, role, patient_id, task_id):
         if doctor["doctor_id"] is not None:
             patient["primary_doctor"] = doctor
         # SQLite 聚合标记为 0/1，接口以布尔值区分能进入哪些筛选。
-        for field in ("is_primary", "has_review", "has_to_fill", "has_completed"):
+        for field in ("is_primary", "has_review", "has_to_fill", "has_scheduled", "has_overdue", "has_completed"):
             patient[field] = bool(patient[field])
     return patients
 
@@ -204,15 +245,22 @@ def list_patients(user_id: str, role: str, patient_id=None, task_id=None) -> lis
 def get_patient_detail(user_id: str, role: str, patient_id: str) -> dict | None:
     """输入后端身份、患者编号，返回 patient/discharges/tasks/records；无权或不存在返回 None。
 
+    患者看到主管医生的 primary_doctor.phone，医生看到患者的 patient.phone，未登记返回 None。
     在同一个只读事务中组装档案，避免医生改派时读到不同权限时刻的数据。
     """
     with closing(get_connection()) as conn:
-        conn.execute("BEGIN")  # 直到档案组装完成，四种查询都看到同一份数据库快照。
+        conn.execute("BEGIN")  # 直到档案组装完成，资料和联系人都来自同一份数据库快照。
         profiles = patient_profiles(conn, user_id, role, patient_id, None)
         if not profiles:
             return None
+        patient = profiles[0]  # 查询条件是患者编号，至多有一份授权档案。
+        if role == "doctor":
+            patient["phone"] = contact_phone(conn, "patient", patient["patient_id"])
+        elif patient["primary_doctor"] is not None:
+            doctor = patient["primary_doctor"]  # 尚无任务的患者也能联系自己的主管医生。
+            doctor["phone"] = contact_phone(conn, "doctor", doctor["doctor_id"])
         # 出院、随访和正式记录各自只读获授权范围，主管身份本身不会开放其他医生的任务。
-        return {"patient": profiles[0],
+        return {"patient": patient,
                 "discharges": query_rows(conn, DISCHARGES, user_id, role, None, patient_id),
                 "tasks": task_summaries(conn, user_id, role, None, patient_id),
                 "records": query_rows(conn, RECORDS, user_id, role, None, patient_id)}
