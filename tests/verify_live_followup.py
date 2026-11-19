@@ -37,14 +37,15 @@ def seed(directory, password):
         conn.executemany("INSERT INTO users(user_id,name,password_hash,role) VALUES(?,?,?,?)",
                          [("U1", "林宇", digest, "patient"), ("U2", "陈怡", digest, "doctor"),
                           ("U3", "何远", digest, "doctor"), ("U4", "周宁", digest, "patient")])
-        conn.executemany("INSERT INTO doctors(doctor_id,user_id,name,department,title) VALUES(?,?,?,?,?)",
-                         [("D1","U2","陈怡","全科","主任医师"), ("D2","U3","何远","心内科","主治医师")])
+        conn.executemany("INSERT INTO doctors(doctor_id,user_id,name,department,title,phone) VALUES(?,?,?,?,?,?)",
+                         [("D1","U2","陈怡","全科","主任医师","010-21001111"),
+                          ("D2","U3","何远","心内科","主治医师","010-21002222")])
         conn.execute("""INSERT INTO patients(patient_id,user_id,name,age,gender,diagnosis,doctor_id)
                         VALUES('P1','U1','林宇',50,'male','高血压','D1')""")
         conn.execute("""INSERT INTO patients(patient_id,user_id,name,age,gender,diagnosis,doctor_id)
                         VALUES('P2','U4','周宁',54,'female','高血压','D1')""")
-        conn.execute("""INSERT INTO discharges(discharge_id,patient_id,discharge_date,discharge_diagnosis)
-                        VALUES('H1','P1','2026-10-01','高血压')""")
+        conn.execute("""INSERT INTO discharges(discharge_id,patient_id,discharge_date,discharge_diagnosis,auto_schedule)
+                        VALUES('H1','P1','2026-10-01','高血压',0)""")
         for n, stage in enumerate(("D7", "D14", "D30"), 1):
             # 第二项任务交由另一位医生负责，使两份已发布报告能核对不同的医生。
             doctor = "D1"
@@ -146,10 +147,12 @@ def run():
         assert page.session_state["message"][-1]["role"] == "assistant"
 
     def doctor_select(page, task):
-        """从医生待办点入一项已提交或待审核任务，只读取资料。"""
+        """回到医生名册，点击本例中患者唯一的待办。仅通过页面读后端，选错任务时断言失败。"""
         click(page, "return_tasks")
-        page.radio(key="doctor_section").set_value("待办随访").run()
-        click(page, "enter_task_" + task)
+        page.radio(key="doctor_section").set_value("我的患者").run()
+        page.selectbox(key="patient_filter").select("待我处理").run()
+        click(page, "roster_work_" + task)
+        assert page.session_state["selected_task"]["task_id"] == task
 
     def review(page, task, action, note="", summary=""):
         view = api(page, "GET", f"/tasks/{task}/report")
@@ -186,9 +189,16 @@ def run():
             empty_patient = login_page("周宁", "患者")
             # 无任务可问助手，医生从名册进入同一份档案；另一位医生仅见自己负责的任务。
             assert "没有随访安排" in screen_text(empty_patient, "info")
+            assert [button.key for button in empty_patient.button if "助手" in button.label] == ["open_assistant"]
+            click(empty_patient, "open_settings")
+            empty_patient.text_input[0].input("010-21003333")
+            empty_patient.text_area[0].input("既往高血压病史三年")
+            click(empty_patient, "FormSubmitter:profile_P2-保存个人资料")
             doctor.selectbox(key="patient_filter").select("暂无任务").run()
             click(doctor, "patient_P2")
             assert "周宁" in screen_text(doctor, "title")
+            assert "既往高血压病史三年" in screen_text(doctor, "markdown")
+            assert "010-21003333" in screen_text(doctor, "code")
             click(doctor, "open_assistant")
             chat(doctor, "请查询当前患者的基本档案，告诉我她的姓名和主管医生。")
             assert "周宁" in doctor.session_state["message"][-1]["content"]
@@ -200,34 +210,47 @@ def run():
                 assert denied.status_code == 404
             click(empty_patient, "open_assistant")
             chat(empty_patient, "请检索健康知识库，告诉我家庭血压记录应包含什么，以及资料名称。")
-            answer = empty_patient.session_state["message"][-1]["content"]
-            assert "血压" in answer and "测量" in answer
+            answer = empty_patient.session_state["message"][-1]
+            assert "血压" in answer["content"] and "测量" in answer["content"]
+            # 移除旧的纯文本 RAG 方法后，聊天仍须把本轮真实检索的片段交给页面。
+            assert answer.get("sources")
+            for source in answer["sources"]:
+                original = (ROOT / "data" / source["source"]).read_text(encoding="utf-8")
+                assert source["excerpt"] and source["excerpt"] in original
             assert "工具rag_search调用成功" in (directory / "service.log").read_text(encoding="utf-8")
             print("通过：无任务患者和医生档案助手可用，两位医生的患者、任务权限独立", flush=True)
             click(patient, "enter_task_F001")
+            assert not patient.text_input and not patient.checkbox
             chat(patient, "我来做这次随访，请问我需要告诉你什么？")
-            chat(patient, "今天早上量的，大压128，小压78。")
+            chat(patient, "今天上午八点半测了一下，高压128，低压78。")
             first = api(patient, "GET", "/tasks/F001/draft")
             assert first["data"]["systolic_bp"] == 128 and first["data"]["diastolic_bp"] == 78
-            assert first["missing_fields"] and "？" in patient.session_state["message"][-1]["content"]
+            assert first["missing_fields"] and not patient.text_input and not patient.checkbox
             click(patient, "open_assistant")
             chat(patient, "我刚量的血压是135/85，请查询本次随访由哪位医生负责。")
             assert "陈怡" in patient.session_state["message"][-1]["content"]
             assert api(patient, "GET", "/tasks/F001/draft")["revision"] == first["revision"]
             click(patient, "resume_context")
-            chat(patient, "最近没有不舒服。每天都按时服药。吃药后没有不舒服。")
-            # 患者核对并修正一次已填数值；仅在模型遗漏时按原话补齐输入。
+            chat(patient, "这几天身上挺好的，药天天按点吃，吃了药也没啥不舒服的。")
+            collected = api(patient, "GET", "/tasks/F001/draft")
+            assert not collected["missing_fields"], collected["missing_fields"]
+            assert collected["data"]["medication_adherence"] == "regular"
+            assert patient.button(key="draft_submit").disabled
+            # 收齐后出现核对表。患者只需更正实际读数，不能自动提交。
             patient.text_input(key="draft_field_systolic_bp").input("126")
-            patient.text_input(key="draft_field_measured_at").input("今天早上八点")
-            patient.text_input(key="draft_field_symptoms").input("最近没有不舒服")
-            patient.text_input(key="draft_field_adverse_effects").input("吃药后没有不舒服")
-            patient.selectbox(key="draft_field_medication_adherence").select("按时服药")
             click(patient, "draft_save")
             saved = api(patient, "GET", "/tasks/F001/draft")
             submitted = submit(patient, "F001")
             again = api(patient, "POST", "/tasks/F001/submit", {"confirmed": True, "expected_revision": saved["revision"]})
             assert again["already_submitted"] and again["record_id"] == submitted["record_id"]
             doctor_select(doctor, "F001")
+            # 医生从当次随访问报告时，应由只读工具取得正式草稿与进度。
+            click(doctor, "open_assistant")
+            chat(doctor, "请查询这次的报告状态，并告诉我报告中记录的血压是多少。")
+            report_answer = doctor.session_state["message"][-1]["content"]
+            assert "126" in report_answer and "78" in report_answer
+            assert "工具get_current_report调用成功" in (directory / "service.log").read_text(encoding="utf-8")
+            click(doctor, "resume_context")
             pending = review(doctor, "F001", "通过")
             assert pending["record"]["systolic_bp"] == 126
             assert pending["content"]["sources"] and pending["content"]["recommendations"]
@@ -243,7 +266,9 @@ def run():
             click(patient, "return_tasks")
             click(patient, "enter_task_F002")
             chat(patient, "我今天还没量血压。最近没有不舒服。出院时没有开药。")
-            # 人工核对路径也可用于真实模型没有识别到的字段。
+            # 独立核对路径接受没测血压及没开药。
+            if any(button.key == "open_manual_form" for button in patient.button):
+                click(patient, "open_manual_form")
             patient.selectbox(key="draft_field_bp_measurement_status").select("还没测")
             patient.selectbox(key="draft_field_medication_adherence").select("没有开药")
             patient.text_input(key="draft_field_symptoms").input("最近没有不舒服")
@@ -279,14 +304,20 @@ def run():
         with server(directory, port, unavailable=True):
             click(patient, "return_tasks")
             click(patient, "enter_task_F003")
+            patient.chat_input[0].set_value("我今天有点不舒服。").run()
+            comfort_notice = screen_text(patient, "warning")
+            assert "120" in comfort_notice and "010-21001111" in comfort_notice
+            assert not api(doctor, "GET", "/notifications")
             patient.chat_input[0].set_value("我现在胸痛。").run()
             alerts = api(doctor, "GET", "/notifications")
             assert len(alerts) == 1 and alerts[0]["task_id"] == "F003"
-            assert len(patient.error) >= 2  # 独立红旗提醒与聊天失败分别显示为两个红色提示。
+            red_flag = screen_text(patient, "error")
+            assert "120" in red_flag and "010-21001111" in red_flag
             assert "胸痛" in screen_text(patient, "markdown")  # 规则触发原因在模型失败后仍保留。
             click(doctor, "return_tasks")
             doctor.radio(key="doctor_section").set_value("风险通知").run()
             assert "胸痛" in screen_text(doctor, "warning")
+            click(patient, "open_manual_form")
             patient.selectbox(key="draft_field_bp_measurement_status").select("还没测")
             patient.selectbox(key="draft_field_medication_adherence").select("没有开药")
             patient.text_input(key="draft_field_symptoms").input("我现在胸痛")

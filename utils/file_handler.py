@@ -79,8 +79,3 @@ def file_loader(filepath: str, password: str = None) -> list[Document]:
         logger.error(f"[file_loader] 加载文件 {filepath} 失败: {str(e)}")
         return []
 
-
-if __name__ == '__main__':
-    # print(listdir_with_allowed_type("C:/Users/Administrator/PycharmProjects/Agent项目智能扫地机器人/data", ('txt',)))
-    print(file_loader("C:/Users/Administrator/PycharmProjects/Agent项目智能扫地机器人/data/故障排除.txt"))
-

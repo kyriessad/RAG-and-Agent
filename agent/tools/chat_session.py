@@ -8,9 +8,9 @@ from utils.logger_handler import logger
 # 每次推理前读取已保存草稿，推理后按旧版本尝试合并。
 from utils.draft_store import get_task_draft, save_task_draft
 from utils import followup_store
-from utils.risk_rules import evaluate_risk
+from utils.risk_rules import patient_chat_notice
 # save_message_risk 在模型创建前可以独立提交通知。
-from utils.risk_store import save_message_risk
+from utils.risk_store import patient_doctor_contact, save_message_risk
 
 
 # 字典的键是登录令牌的哈希，不保存原始令牌。
@@ -74,23 +74,32 @@ def stream_chat(session_key, user_id, role, message, task_id=None, patient_id=No
     同会话并发、模型失败或版本冲突返回 error，不提交正式记录或改变任务状态。
     """
     # 风险检查不占用模型会话锁；上一条消息还在回答时，新危险信息仍应先提醒。
-    if role == "patient":
-        risk = evaluate_risk(message=message)  # 不等模型提取、不等草稿完整，也不读旧草稿才能检查。
-        # 只有命中升级规则才提前写通知，普通消息继续向下采集。
-        if risk["level"] == "high":
-            if task_id is None:
-                # 首页不自动挑选一次历史随访发通知，立即给出可见的规则提示。
-                yield {"type": "risk", "content": {"risk": risk, "notification_saved": False,
-                                                    "notification_reason": "no_task"}}
+    risk = patient_chat_notice(message) if role == "patient" else None
+    if risk:
+        notice = {"risk": dict(risk)}
+        delivery_failed = False
+        try:
+            if risk["level"] == "high":
+                notice["notification_saved"], contact = save_message_risk(user_id, role, task_id, risk)
+                if not notice["notification_saved"]:
+                    notice["notification_reason"] = "no_doctor"
             else:
-                try:
-                    saved = save_message_risk(user_id, role, task_id, risk)
-                except Exception as error:
-                    logger.error("风险通知保存失败，错误类型：%s", type(error).__name__)
-                    yield {"type": "risk", "content": {"risk": risk, "notification_saved": False}}
-                    yield {"type": "error", "content": "医生通知未能保存。请直接联系医生或及时就医，不要等待助手回复。"}
-                    return
-                yield {"type": "risk", "content": {"risk": risk, "notification_saved": saved}}
+                contact = patient_doctor_contact(user_id, task_id)
+        except Exception as error:
+            logger.error("不适提醒读取或投递失败，错误类型：%s", type(error).__name__)
+            contact = "暂时无法读取医生电话。"
+            if risk["level"] == "high":
+                delivery_failed = True
+                notice["notification_saved"] = False
+                try:  # 通知写入失败时，档案电话仍可能可以读取。
+                    contact = patient_doctor_contact(user_id, task_id)
+                except Exception as contact_error:
+                    logger.error("医生联系方式读取失败，错误类型：%s", type(contact_error).__name__)
+        notice["risk"]["patient_message"] += "\n\n" + contact
+        yield {"type": "risk", "content": notice}
+        if delivery_failed:
+            yield {"type": "error", "content": "医生通知未能保存。请直接联系医生或及时就医，不要等待助手回复。"}
+            return
 
     # monotonic() 是只向前走的计时值，用于清理一天没有使用的内存会话。
     now = monotonic()

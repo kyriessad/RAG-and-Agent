@@ -6,8 +6,9 @@ import json
 # 捕获 SQLite 的表、连接或事务异常，统一转成前端可处理的 HTTP 状态。
 import sqlite3
 from contextlib import asynccontextmanager
-from datetime import timedelta, timezone
+from datetime import date, timedelta, timezone
 from typing import Literal
+from uuid import UUID
 
 # 随访的定时扫描运行在后端，浏览器关闭后仍能按时开放任务。
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -32,7 +33,7 @@ from utils.draft_store import SaveDraftData, get_task_draft, save_task_draft
 # 正式提交单独检查患者确认，成功后返回不可覆盖的记录编号。
 from utils.submission_store import SubmitDraftData, submit_task_draft
 # 医生工作台从 notifications 读取已经写入的风险通知。
-from utils.risk_store import list_doctor_notifications
+from utils.risk_store import handle_doctor_notification, list_doctor_notifications, migrate_risk_notifications
 # 规则判断可以独立执行，即使后面的写库或模型调用失败也能提醒。
 from utils.risk_rules import evaluate_risk
 from utils.logger_handler import logger
@@ -41,6 +42,7 @@ from utils.logger_handler import logger
 async def lifespan(application):
     """启动时升级排期字段、补扫到期事项，每分钟继续扫描；数据库错误向启动方报告。"""
     user_store.init_db()
+    migrate_risk_notifications()
     schedule_store.migrate_schedule()  # 首次启用时标记已有出院记录，后续启动保留原标记。
     schedule_store.scan_schedule()  # 停机期间到期的任务从本次实际开放起算 48 小时。
     scheduler = BackgroundScheduler(timezone=timezone(timedelta(hours=8)))
@@ -79,6 +81,28 @@ class AccountData(BaseModel):
 class LoginData(AccountData):
     """登录时可附加页面入口，实际角色取自账号。旧客户端可省略入口。"""
     role: Literal["patient", "doctor"] | None = None
+
+
+class RegistrationPatientProfile(BaseModel):
+    """注册表单中的患者档案；例如 age=56、gender='female'、doctor_id='D002'。"""
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    # 与现库年龄字段一致。SQLite 的 INTEGER 能保存的最大值是有符号 64 位整数上限。
+    age: int = Field(strict=True, ge=0, le=9223372036854775807)
+    gender: Literal["female", "male", "unknown"]
+    doctor_id: str = Field(min_length=1, max_length=64)  # 主管医生由患者在简要名录中选择。
+    phone: str | None = Field(default=None, max_length=32)
+
+
+class PatientRegistrationData(AccountData):
+    """网页传完整档案，已有客户端仍可只传账号密码。"""
+    profile: RegistrationPatientProfile | None = None
+
+
+class DoctorRegistrationData(AccountData):
+    """本机医生直接注册时所需科室和选填的联系资料；角色由医生注册路由固定。"""
+    department: str = Field(min_length=1, max_length=64)
+    title: str | None = Field(default=None, max_length=64)
+    phone: str | None = Field(default=None, max_length=32)
 
 
 class ChatData(BaseModel):
@@ -120,18 +144,40 @@ async def database_error(request, error):
     return JSONResponse(status_code=503, content={"detail": "医疗数据库暂时无法使用，请检查后端日志。"})
 
 
-# POST /auth/register 成功时返回 201，表示新建了患者登录账号。
-@app.post("/auth/register", status_code=201)
-def register(data: AccountData):
-    """接收用户名和密码，写入一个患者账号并返回提示；空用户名 422，重名 409。"""
-    # 患者自主注册；医生使用医疗库中已经分配好角色的账号。
-    if not data.username.strip():
-        raise HTTPException(status_code=422, detail="用户名不能为空。")
-    # False 表示用户名冲突；数据库连接错误会向上传给统一错误处理。
-    if not user_store.register_user(data.username, data.password):
-        raise HTTPException(status_code=409, detail="用户名已存在。")
-    # 成功注册的患者需要登录后才能取得访问任务所需的凭证。
+def register_account(data: AccountData, role: str, profile: dict | None):
+    """转交角色专用入口的数据并写库，返回注册回执。重复或医生失效返回 409，无效字段返回 422。"""
+    try:
+        created = user_store.register_user(data.username, data.password, role=role, profile=profile)
+    except LookupError as error:  # 名录与提交间发生变化，提示重新选择。
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    except ValueError as error:  # 姓名和科室经过清理后也必须是非空文本。
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    if not created:
+        raise HTTPException(status_code=409, detail="该姓名已注册，请登录或核对姓名。")
     return {"message": "注册成功，请登录。"}
+
+
+# 注册前可查看主管医生选项，只公开名片摘要，不需要已有登录凭证。
+@app.get("/auth/doctors")
+def registration_doctors():
+    """无入参，只读可选医生；即便名录为空，也返回 {"doctors": []}。数据库错误返回 503。"""
+    return {"doctors": user_store.list_registration_doctors()}
+
+
+@app.post("/auth/register", status_code=201)
+def register(data: PatientRegistrationData):
+    """接收患者姓名、密码和可选档案，写入账号并返回成功回执；冲突和校验错误交给共同处理。"""
+    profile = None
+    if data.profile is not None:
+        profile = data.profile.model_dump()  # 档案的字段、类型与必填项已经校验。
+    return register_account(data, "patient", profile)
+
+
+@app.post("/auth/register/doctor", status_code=201)
+def register_doctor(data: DoctorRegistrationData):
+    """接收医生姓名、密码、科室和选填资料，同事务创建账号与医生档案，重复姓名返回 409。"""
+    profile = data.model_dump(exclude={"username", "password"})  # 档案中只传科室、职称和电话。
+    return register_account(data, "doctor", profile)
 
 
 # POST 表示凭证放在请求体，避免密码出现在 URL 中。
@@ -179,6 +225,74 @@ def patient_detail(patient_id: str, user: dict = Depends(current_user)):
     if detail is None:
         raise HTTPException(status_code=404, detail="患者不存在或无权访问。")
     return detail
+
+
+class PatientProfileUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    phone: str | None = Field(default=None, max_length=32)
+    medical_history: str | None = Field(default=None, max_length=2000)
+
+
+@app.patch("/patients/{patient_id}")
+def update_patient_profile(patient_id: str, data: PatientProfileUpdate, user: dict = Depends(current_user)):
+    """患者可以修改本人的联系电话与既往病史，未提交的字段保留原值。"""
+    if user["role"] != "patient":
+        raise HTTPException(status_code=403, detail="只有患者本人可以修改个人资料。")
+    changes = data.model_dump(exclude_unset=True)
+    if not changes:
+        raise HTTPException(status_code=422, detail="请选择要修改的资料。")
+    if not followup_store.update_own_profile(user["user_id"], patient_id, changes):
+        raise HTTPException(status_code=404, detail="患者不存在或无权访问。")
+    return {"message": "个人资料已保存。"}
+
+
+class DischargeDetails(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    discharge_instructions: str | None = Field(default=None, max_length=4000)
+    discharge_medications: str | None = Field(default=None, max_length=4000)
+
+
+class DischargeRegistration(DischargeDetails):
+    """保存主管医生填写的出院原文，旧表单仍可以只提供日期和诊断。"""
+    request_id: UUID  # 同一次表单提交使用固定编号，断线可原样重试。
+    discharge_date: date  # 例如 "2026-11-18"，不要求浏览器自行计算 D7。
+    discharge_diagnosis: str = Field(min_length=1, max_length=500)
+
+
+# FastAPI 把 JSON 校验为 DischargeRegistration 后再调用存储层，在一个事务内完成登记。
+@app.post("/patients/{patient_id}/discharges", status_code=201)
+def register_discharge(patient_id: str, data: DischargeRegistration, user: dict = Depends(current_user)):
+    """主管医生登记出院并取得三轮随访安排。scheduled_at 保留首轮开放时间。"""
+    if user["role"] != "doctor":
+        raise HTTPException(status_code=403, detail="只有主管医生可以登记出院。")
+    try:
+        receipt = schedule_store.register_discharge(
+            user["user_id"], patient_id, data.request_id, data.discharge_date, data.discharge_diagnosis,
+            data.discharge_instructions or None, data.discharge_medications or None,
+        )
+    except schedule_store.DischargeConflict as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    if receipt is None:
+        raise HTTPException(status_code=404, detail="患者不存在或无权登记出院。")
+    return receipt
+
+
+@app.patch("/patients/{patient_id}/discharges/{discharge_id}")
+def supplement_discharge(patient_id: str, discharge_id: str, data: DischargeDetails, user: dict = Depends(current_user)):
+    if user["role"] != "doctor":
+        raise HTTPException(status_code=403, detail="只有主管医生可以补充出院资料。")
+    changes = data.model_dump(exclude_unset=True)
+    if not changes or not all(changes.values()):
+        raise HTTPException(status_code=422, detail="请填写需要补充的医嘱或用药。")
+    try:
+        found = schedule_store.supplement_discharge(user["user_id"], patient_id, discharge_id, changes)
+    except schedule_store.DischargeConflict as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    if not found:
+        raise HTTPException(status_code=404, detail="出院记录不存在或无权补充。")
+    return {"message": "出院资料已补充。"}
 
 
 # GET /tasks 没有身份参数，即使医生查任务也只用服务器确认的身份。
@@ -293,12 +407,23 @@ def generate_submitted_report(user, task_id, record_id):
 
 @app.get("/notifications")
 def doctor_notifications(user: dict = Depends(current_user)):
-    """返回当前负责医生收到的风险通知列表；只读，不实现通知处理或报告审核。"""
+    """返回当前负责医生收到的风险通知列表。"""
     try:
         # SQL 同时检查接收人和任务当前负责医生，改派后旧医生无法读取。
         return list_doctor_notifications(user["user_id"], user["role"])
     except PermissionError as error:
         raise HTTPException(status_code=403, detail=str(error)) from error
+
+
+@app.post("/notifications/{notice_id}/handle")
+def handle_risk_notification(notice_id: int, user: dict = Depends(current_user)):
+    try:
+        notice = handle_doctor_notification(user["user_id"], user["role"], notice_id)
+    except PermissionError as error:
+        raise HTTPException(status_code=403, detail=str(error)) from error
+    if notice is None:
+        raise HTTPException(status_code=404, detail="风险通知不存在或无权处理。")
+    return notice
 
 
 @app.get("/notifications/schedule")

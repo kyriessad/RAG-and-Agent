@@ -17,3 +17,8 @@ docx2txt==0.9
 
 
 streamlit==1.67.0
+fastapi==0.163.1
+uvicorn==0.54.0
+APScheduler==3.11.3
+requests==2.34.2
+pydantic==2.14.3

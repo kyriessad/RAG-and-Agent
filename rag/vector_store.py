@@ -5,7 +5,6 @@
 get_retriever返回检索器，可以加入链调用invoke返回相关文本块
 """
 import os
-from datetime import datetime
 from langchain_core.documents import Document
 from langchain_chroma import Chroma
 from utils.config_handler import chroma_conf
@@ -211,7 +210,3 @@ if __name__ == '__main__':
     # 导入数据
     vs = VectorStoreService()
     vs.load_document()
-
-    # res = vs.get_retriever().invoke("机器人")
-    # for r in res:
-    #     print(r.page_content)

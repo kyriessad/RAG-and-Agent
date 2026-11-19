@@ -7,7 +7,7 @@ from langchain_core.messages import ToolMessage
 from langgraph.runtime import Runtime
 from langgraph.types import Command
 from utils.logger_handler import logger
-from utils.prompt_loader import load_report_prompts, load_system_prompts
+from utils.prompt_loader import load_system_prompts
 from agent.tools.draft_collection import collection_prompt
 
 
@@ -17,14 +17,11 @@ def monitor_tool(
         request: ToolCallRequest,
         handler: Callable[[ToolCallRequest], ToolMessage | Command]
 ) -> ToolMessage | Command:
-
+    """执行请求中的工具，记录名称并返回原结果；工具失败时记下异常类型并继续抛出。"""
     logger.info(f"[tool monitor]执行工具: {request.tool_call['name']}")
     # 记录工具名称即可，参数可能含患者描述，不把完整健康信息写入日志。
 
     try:
-        # 真正开始执行工具
-        if request.tool_call['name'] == "fill_context_for_report":
-            request.runtime.context["report"] = True
         result = handler(request)
         logger.info(f"[tool monitor]工具{request.tool_call['name']}调用成功")
         return result
@@ -47,13 +44,8 @@ def log_before_model(
     return None
 
 
-# 每次在生成提示词之前调用此函数   prompt_template之前
-@dynamic_prompt                 # 每一次在生成提示词之前，调用此函数
-def report_prompt_switch(request: ModelRequest):  # 动态切换提示词
-    """输入框架模型请求，返回系统提示词及当前采集草稿；不请求网络或写库。"""
-    is_report = request.runtime.context.get("report", False)
-    if is_report:               # 是报告生成场景，返回报告生成提示词内容
-        return load_report_prompts()
-
-    # 每次推理携带后端本轮读取的草稿；患者手工修改优先于旧聊天记忆。
+# 框架在每次推理前调用，患者手工保存的修改会进入下一轮的采集提示。
+@dynamic_prompt
+def followup_prompt(request: ModelRequest):
+    """读取系统提示词，按请求上下文附上本轮草稿并返回文本；文件读取错误向上传递。"""
     return load_system_prompts() + collection_prompt(request.runtime.context)

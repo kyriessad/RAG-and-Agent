@@ -242,10 +242,25 @@ def list_patients(user_id: str, role: str, patient_id=None, task_id=None) -> lis
         return patient_profiles(conn, user_id, role, patient_id, task_id)
 
 
+def update_own_profile(user_id: str, patient_id: str, changes: dict) -> bool:
+    """仅更新登录患者本人填报的资料，显式清空与省略字段分别处理。"""
+    with closing(get_connection()) as conn, conn:
+        cursor = conn.execute(
+            """UPDATE patients
+               SET phone=CASE WHEN ? THEN ? ELSE phone END,
+                   medical_history=CASE WHEN ? THEN ? ELSE medical_history END
+               WHERE patient_id=? AND user_id=?
+                 AND EXISTS (SELECT 1 FROM users u WHERE u.user_id=patients.user_id AND u.role='patient')""",
+            ("phone" in changes, changes.get("phone") or None,
+             "medical_history" in changes, changes.get("medical_history") or None, patient_id, user_id),
+        )
+        return cursor.rowcount == 1
+
+
 def get_patient_detail(user_id: str, role: str, patient_id: str) -> dict | None:
     """输入后端身份、患者编号，返回 patient/discharges/tasks/records；无权或不存在返回 None。
 
-    患者看到主管医生的 primary_doctor.phone，医生看到患者的 patient.phone，未登记返回 None。
+    授权档案含患者的 patient.phone，本人还能看到主管医生的 primary_doctor.phone。
     在同一个只读事务中组装档案，避免医生改派时读到不同权限时刻的数据。
     """
     with closing(get_connection()) as conn:
@@ -254,9 +269,8 @@ def get_patient_detail(user_id: str, role: str, patient_id: str) -> dict | None:
         if not profiles:
             return None
         patient = profiles[0]  # 查询条件是患者编号，至多有一份授权档案。
-        if role == "doctor":
-            patient["phone"] = contact_phone(conn, "patient", patient["patient_id"])
-        elif patient["primary_doctor"] is not None:
+        patient["phone"] = contact_phone(conn, "patient", patient["patient_id"])
+        if role == "patient" and patient["primary_doctor"] is not None:
             doctor = patient["primary_doctor"]  # 尚无任务的患者也能联系自己的主管医生。
             doctor["phone"] = contact_phone(conn, "doctor", doctor["doctor_id"])
         # 出院、随访和正式记录各自只读获授权范围，主管身份本身不会开放其他医生的任务。

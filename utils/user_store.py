@@ -6,6 +6,7 @@ import hmac
 import secrets
 # SQLite 连接负责参数化查询、事务以及外键校验。
 import sqlite3
+from contextlib import closing  # 注册事务结束后释放连接，包括校验失败的分支。
 # 统一按 UTC 保存过期时刻；timedelta 表示有效时长。
 from datetime import datetime, timedelta, timezone
 # Path 把含中文或空格的本地路径转换成 SQLite 可读取的 URI。
@@ -97,40 +98,76 @@ def init_db():
         conn.close()
 
 
-def register_user(username: str, password: str) -> bool:
-    """注册患者账号；成功返回 True，用户名重复返回 False。"""
-    # 清理用户名前后空格；密码保留用户输入的原值。
+def list_registration_doctors() -> list[dict]:
+    """无参数，只读公开的医生选项，返回医生编号、姓名、科室和职称；无人可选时返回空列表。"""
+    # 登录前的名录只展示选择主管医生需要的资料；联系方式在授权档案中获取。
+    with closing(get_connection()) as conn:
+        rows = conn.execute(
+            """SELECT d.doctor_id, d.name, d.department, d.title
+               FROM doctors d JOIN users u ON u.user_id=d.user_id
+               WHERE u.role='doctor' ORDER BY d.department, d.name, d.doctor_id"""
+        )
+        doctors = []
+        for row in rows:
+            doctors.append(dict(row))
+        return doctors
+
+
+def register_user(username: str, password: str, *, role="patient", profile=None) -> bool:
+    """将账号与注册表单中的档案一起写库。旧调用只传姓名和密码，仍可仅建立患者账号。
+
+    role 由路由固定。患者 profile 含 age、gender、doctor_id；医生 profile 必须有 department。
+    成功返回 True，重名返回 False，主管医生已失效抛 LookupError，必填项为空抛 ValueError。
+    """
+    # 姓名在账号和档案中始终一致；密码保留用户实际输入的空格。
     username = username.strip()
     if not username or not password:
-        raise ValueError("用户名和密码不能为空。")
-
-    # 医疗库的 user_id 是文本，例如 U 加上一串唯一编号，不再使用自增整数。
+        raise ValueError("姓名和密码不能为空。")
+    if role not in ("doctor", "patient"):
+        raise ValueError("请选择患者或医生注册。")
+    if role == "doctor":
+        department = ""
+        if profile is not None:
+            department = (profile.get("department") or "").strip()  # 全空格的科室也不能用于建档。
+        if not department:
+            raise ValueError("请填写医生所在科室。")
+    # 编号由服务端分配；耗时的密码哈希在获取写锁前完成。
     user_id = "U" + uuid4().hex
-    # 在打开写事务前完成较慢的密码哈希计算。
     password_hash = hash_password(password)
-    conn = get_connection()
-    try:
-        # 注册页不能选择医生角色；医生账号由已有医疗账号体系提供。
-        # 这里只创建登录账号，不自动编造患者姓名、年龄或病历。
-        conn.execute(
-            "INSERT INTO users (user_id, name, password_hash, role) VALUES (?, ?, ?, 'patient')",
-            # 问号按顺序绑定这三个值，用户名里的引号也只是普通输入。
-            (user_id, username, password_hash),
+    with closing(get_connection()) as conn, conn:
+        conn.execute("BEGIN IMMEDIATE")  # 锁内校验医生，防止点提交时主管医生已被改派角色或删除。
+        created = conn.execute(
+            """INSERT INTO users(user_id,name,password_hash,role) VALUES(?,?,?,?)
+               ON CONFLICT(name) DO NOTHING""",
+            (user_id, username, password_hash, role),
         )
-        # 提交后新账号才能被另一个 HTTP 请求查询到。
-        conn.commit()
-        return True
-    # 两次同时注册也由数据库唯一约束判定哪一次成功。
-    except sqlite3.IntegrityError as error:
-        # 撤销当前失败的注册事务，准备返回冲突或向上抛错。
-        conn.rollback()
-        # 只把用户名重复解释为“注册失败”，其它数据库错误交给后端处理。
-        if error.sqlite_errorname == "SQLITE_CONSTRAINT_UNIQUE":
+        if created.rowcount == 0:  # 两个请求同时注册同名时，后到的请求不能覆盖原账号。
             return False
-        # 其他约束错误不应伪装成“用户名被占用”。
-        raise
-    finally:
-        conn.close()
+        if profile is None:
+            return True  # 兼容只传账号密码的旧患者客户端。
+        phone = (profile.get("phone") or "").strip() or None  # 联系卡将未登记的号码显示为空。
+        if role == "doctor":
+            title = (profile.get("title") or "").strip() or None
+            conn.execute(
+                """INSERT INTO doctors(doctor_id,user_id,name,department,title,phone)
+                   VALUES(?,?,?,?,?,?)""",
+                ("D" + uuid4().hex, user_id, username, department, title, phone),
+            )
+        else:
+            # 下拉框保存的是医生档案编号；提交时核对当前账号仍有医生身份。
+            doctor = conn.execute(
+                """SELECT d.doctor_id FROM doctors d JOIN users u ON u.user_id=d.user_id
+                   WHERE d.doctor_id=? AND u.role='doctor'""", (profile["doctor_id"],),
+            ).fetchone()
+            if doctor is None:
+                raise LookupError("所选主管医生已不可选，请重新选择。")  # 撤销本次刚创建的账号。
+            conn.execute(
+                """INSERT INTO patients(patient_id,user_id,name,age,gender,doctor_id,phone)
+                   VALUES(?,?,?,?,?,?,?)""",
+                ("P" + uuid4().hex, user_id, username, profile["age"], profile["gender"],
+                 doctor["doctor_id"], phone),
+            )
+        return True  # 离开事务块后，账号与档案同时可见。
 
 
 def login_user(username: str, password: str, role: str | None = None) -> dict | None:

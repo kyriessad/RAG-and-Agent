@@ -21,8 +21,3 @@ def get_project_root() -> str:
 # 获得传入文件的绝对路径
 def get_abs_path(file_relative_path: str) -> str:
     return os.path.join(get_project_root(), file_relative_path)
-
-
-if __name__ == '__main__':
-    print(get_project_root())
-    print(get_abs_path("data/故障排除.txt"))

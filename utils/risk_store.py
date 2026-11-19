@@ -3,8 +3,55 @@
 import hashlib
 import json
 import sqlite3
+from contextlib import closing
+from uuid import uuid4
 
 from utils.user_store import get_connection
+
+
+def migrate_risk_notifications():
+    """无任务的首页告警直接关联患者档案，既有任务告警仍按原任务查找。"""
+    with closing(get_connection()) as conn, conn:
+        conn.execute("BEGIN IMMEDIATE")
+        if not conn.execute("SELECT 1 FROM pragma_table_info('notifications') WHERE name='patient_id'").fetchone():
+            conn.execute("ALTER TABLE notifications ADD COLUMN patient_id TEXT REFERENCES patients(patient_id)")
+        if not conn.execute("SELECT 1 FROM pragma_table_info('notifications') WHERE name='handled_at'").fetchone():
+            conn.execute("ALTER TABLE notifications ADD COLUMN handled_at TEXT")
+
+
+def patient_doctor(conn, user_id, task_id):
+    if task_id is None:
+        query = """SELECT du.user_id,p.patient_id,d.name,d.phone FROM patients p
+                   JOIN doctors d ON d.doctor_id=p.doctor_id
+                   JOIN users du ON du.user_id=d.user_id AND du.role='doctor'
+                   JOIN users u ON u.user_id=p.user_id AND u.role='patient'
+                   WHERE u.user_id=?"""
+        params = (user_id,)
+    else:
+        query = """SELECT du.user_id,p.patient_id,d.name,d.phone FROM followup_tasks t
+                   JOIN doctors d ON d.doctor_id=t.doctor_id
+                   JOIN users du ON du.user_id=d.user_id AND du.role='doctor'
+                   JOIN discharges h ON h.discharge_id=t.discharge_id
+                   JOIN patients p ON p.patient_id=h.patient_id
+                   JOIN users u ON u.user_id=p.user_id AND u.role='patient'
+                   WHERE u.user_id=? AND t.task_id=?
+                     AND (t.scheduled_at IS NULL OR t.opened_at IS NOT NULL)"""
+        params = (user_id, task_id)
+    return conn.execute(query, params).fetchone()
+
+
+def contact_text(row, task_id):
+    if row is None:
+        return "未查到对应医生的联系方式。"
+    label = "本次随访医生" if task_id is not None else "主管医生"
+    phone = (row["phone"] or "").strip()
+    return f"{label} {row['name']} 的联系电话为 {phone}。" if phone else f"{label} {row['name']} 尚未登记联系电话。"
+
+
+def patient_doctor_contact(user_id, task_id=None):
+    """查询本患者、当前任务内的负责医生；无任务时读取主管医生。"""
+    with closing(get_connection()) as conn:
+        return contact_text(patient_doctor(conn, user_id, task_id), task_id)
 
 
 def save_risk_notification(conn, user_id, task_id, risk, source):
@@ -17,22 +64,29 @@ def save_risk_notification(conn, user_id, task_id, risk, source):
     """
     if risk["level"] != "high":  # 不把缺信息或未命中规则当成紧急告警。
         return False
-    doctor = conn.execute(
-        """SELECT u.user_id FROM followup_tasks AS t
-           JOIN doctors AS d ON d.doctor_id=t.doctor_id
-           JOIN users AS u ON u.user_id=d.user_id AND u.role='doctor'
-           WHERE t.task_id=?""", (task_id,),
-    ).fetchone()  # 用任务上的当前负责医生，不能使用模型或患者传入的接收人。
+    doctor = patient_doctor(conn, user_id, task_id)
     if doctor is None:
+        if task_id is None:
+            return False
         raise sqlite3.DatabaseError("风险通知无法找到负责医生账号。")
-    identity = json.dumps([task_id, doctor["user_id"], sorted(risk["rule_codes"])], ensure_ascii=False)
-    event_key = "risk:" + hashlib.sha256(identity.encode("utf-8")).hexdigest()  # 数据库唯一键负责去重。
+    patient_id = doctor["patient_id"] if task_id is None else None
+    identity = json.dumps([task_id or patient_id, doctor["user_id"], sorted(risk["rule_codes"])], ensure_ascii=False)
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+    event_key = "risk:" + digest
+    if task_id is None:
+        # 首页没有任务生命周期。五分钟内同一患者、医生和规则重发只入库一次，之后可再次升级。
+        prefix = "risk:home:" + digest + ":"
+        repeated = conn.execute("""SELECT 1 FROM notifications WHERE event_key LIKE ?
+                                   AND created_at >= datetime('now','-5 minutes')""", (prefix + "%",)).fetchone()
+        if repeated:
+            return True
+        event_key = prefix + uuid4().hex
     message = "随访风险提醒：" + "；".join(risk["reasons"])  # 保存命中依据，方便医生核对。
     message += "。信息来源：" + source + "。请及时核对患者情况；规则提醒不代表诊断。"
     cursor = conn.execute(
-        """INSERT INTO notifications(user_id,task_id,message,event_key,created_at)
-           VALUES(?,?,?,?,CURRENT_TIMESTAMP) ON CONFLICT(event_key) DO NOTHING""",
-        (doctor["user_id"], task_id, message, event_key),
+        """INSERT INTO notifications(user_id,task_id,patient_id,message,event_key,created_at)
+           VALUES(?,?,?,?,?,CURRENT_TIMESTAMP) ON CONFLICT(event_key) DO NOTHING""",
+        (doctor["user_id"], task_id, patient_id, message, event_key),
     )  # 重复检查返回已有通知，不重复插入，也不把其他约束错误吞掉。
     if cursor.rowcount == 1:
         details = json.dumps({"source": source, "risk": risk, "recipient_id": doctor["user_id"]}, ensure_ascii=False)
@@ -61,7 +115,7 @@ def list_task_risk_alerts(conn, task_id):
 
 
 def save_message_risk(user_id, role, task_id, risk):
-    """患者原话先经纯规则检查，再调用此函数独立提交通知；返回是否已保存。
+    """患者原话先经纯规则检查，独立提交通知并返回同一快照内的医生联系方式。
 
     权限失败抛 PermissionError，库错误向上抛出；不读草稿、不依赖模型成功。
     例如患者说“现在胸痛”，即使草稿缺项或随后模型出错，通知仍已持久保存。
@@ -71,10 +125,14 @@ def save_message_risk(user_id, role, task_id, risk):
     conn = get_connection()
     try:
         conn.execute("BEGIN IMMEDIATE")  # 独立事务先保存告警，再进入可能失败的模型调用。
-        require_patient_task(conn, user_id, role, task_id)  # 写入前再次核对真实角色和任务归属。
+        if role != "patient":
+            raise PermissionError("只有患者可以报告本人的不适。")
+        if task_id is not None:
+            require_patient_task(conn, user_id, role, task_id)
         saved = save_risk_notification(conn, user_id, task_id, risk, "患者对话，尚未经确认提交")
+        contact = contact_text(patient_doctor(conn, user_id, task_id), task_id)
         conn.commit()
-        return saved
+        return saved, contact
     except Exception:
         conn.rollback()
         raise
@@ -82,8 +140,37 @@ def save_message_risk(user_id, role, task_id, risk):
         conn.close()
 
 
+DOCTOR_ALERTS = """
+    SELECT n.id,n.task_id,p.patient_id,p.name AS patient_name,n.message,n.created_at,n.read_at,n.handled_at
+    FROM notifications AS n
+    LEFT JOIN followup_tasks AS t ON t.task_id=n.task_id
+    LEFT JOIN discharges AS d ON d.discharge_id=t.discharge_id
+    JOIN patients AS p ON p.patient_id=CASE WHEN n.task_id IS NULL THEN n.patient_id ELSE d.patient_id END
+    JOIN doctors AS doctor ON doctor.doctor_id=CASE WHEN n.task_id IS NULL THEN p.doctor_id ELSE t.doctor_id END
+    JOIN users AS u ON u.user_id=doctor.user_id AND u.role='doctor'
+    WHERE n.user_id=:doctor AND u.user_id=:doctor AND n.event_key LIKE 'risk:%'
+"""
+
+
+def handle_doctor_notification(user_id, role, notice_id):
+    """在复核归属的事务内登记首次处理时间。多次确认返回原回执。"""
+    if role != "doctor":
+        raise PermissionError("只有负责医生可以处理风险通知。")
+    with closing(get_connection()) as conn, conn:
+        conn.execute("BEGIN IMMEDIATE")
+        scoped_notice = DOCTOR_ALERTS + " AND n.id=:id"
+        params = {"doctor": user_id, "id": notice_id}
+        row = conn.execute(scoped_notice, params).fetchone()
+        if row is None:
+            return None
+        if row["handled_at"] is None:
+            conn.execute("UPDATE notifications SET handled_at=CURRENT_TIMESTAMP WHERE id=?", (notice_id,))
+            row = conn.execute(scoped_notice, params).fetchone()
+        return dict(row)
+
+
 def list_doctor_notifications(user_id, role):
-    """输入服务端医生身份，返回当前名下任务的风险通知列表；只读数据库。
+    """返回本人作为任务负责人或主管医生收到的风险通知。
 
     患者或已改成其他角色的账号抛 PermissionError；无通知返回 []。
     同时核对通知接收人和任务当前负责医生，任务改派后旧医生不能继续读取。
@@ -96,16 +183,8 @@ def list_doctor_notifications(user_id, role):
         account = conn.execute("SELECT role FROM users WHERE user_id=?", (user_id,)).fetchone()
         if account is None or account["role"] != "doctor":
             raise PermissionError("只有负责医生可以查看风险通知。")
-        rows = conn.execute(
-            """SELECT n.id,n.task_id,p.patient_id,p.name AS patient_name,n.message,n.created_at,n.read_at
-               FROM notifications AS n
-               JOIN followup_tasks AS t ON t.task_id=n.task_id
-               JOIN doctors AS doctor ON doctor.doctor_id=t.doctor_id
-               JOIN discharges AS d ON d.discharge_id=t.discharge_id
-               JOIN patients AS p ON p.patient_id=d.patient_id
-               WHERE n.user_id=? AND doctor.user_id=? AND n.event_key LIKE 'risk:%'
-               ORDER BY n.id DESC""", (user_id, user_id),
-        ).fetchall()  # SQL 内过滤权限，不先读取所有患者再让页面过滤。
+        rows = conn.execute(DOCTOR_ALERTS + " ORDER BY (n.handled_at IS NOT NULL), n.id DESC",
+                            {"doctor": user_id}).fetchall()
         notifications = []
         for row in rows:
             notifications.append(dict(row))

@@ -12,21 +12,20 @@ class RagService(object):
     def retriever_docs(self, query: str) -> list[Document]:
         return self.retriever.invoke(query)
 
-    # 用户提问，得到相关文本块
-    def rag_search(self, query: str) -> str:
-        # 检索相关文本块
-        context_docs = self.retriever_docs(query)
-        if not context_docs:
-            return "知识库未检索到相关资料。"
-        # 整理资料，直接返回给 Agent
+    def search_with_sources(self, query: str) -> tuple[str, list[dict]]:
+        """输入问题，返回给模型的文本和给页面的原文列表。调用嵌入服务并读取索引，失败时抛出异常。"""
         parts = []
-        for index, doc in enumerate(context_docs, start=1):
-            source = os.path.basename(doc.metadata.get("source", "未知来源"))
-            parts.append(
-                f"【参考资料{index}】\n"
-                f"来源：{source}\n"
-                f"{doc.page_content}"
-            )
-        return "\n\n".join(parts)
-
-
+        sources = []  # 例如 [{"source": "家庭血压测量与记录.txt", "excerpt": "……"}]。
+        for doc in self.retriever_docs(query):
+            # 文件名和原文都来自索引。缺失来源时跳过，避免给回答附上无法核对的材料。
+            name = os.path.basename(doc.metadata.get("source") or "")
+            if not name or not doc.page_content.strip():
+                continue
+            entry = {"source": name, "excerpt": doc.page_content}
+            if entry in sources:
+                continue
+            sources.append(entry)
+            parts.append(f"【参考资料{len(sources)}】\n来源：{name}\n{doc.page_content}")
+        if not sources:
+            return "知识库未检索到可核对的原文，当前资料不足以回答。", []
+        return "\n\n".join(parts), sources

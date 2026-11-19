@@ -45,10 +45,3 @@ def get_logger(name="agent", console_level=logging.INFO, file_level=logging.DEBU
 
 # 快捷获取日志器
 logger = get_logger()
-
-
-if __name__ == '__main__':
-    logger.info("开始执行信息")
-    logger.error("执行失败错误")
-    logger.warning("天气工具调用次数接近上限")
-    logger.debug("调试模式")

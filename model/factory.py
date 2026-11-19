@@ -8,7 +8,6 @@ from langchain_openai import OpenAIEmbeddings
 from langchain_openai import ChatOpenAI
 
 from utils.config_handler import rag_conf
-from utils.logger_handler import logger
 
 
 class BaseModelFactory(ABC):
@@ -43,6 +42,3 @@ class EmbeddingsFactory(BaseModelFactory):
 chat_model = ChatModelFactory().generator()
 # 嵌入模型对象
 embedding_model = EmbeddingsFactory().generator()
-
-if __name__ == '__main__':
-    logger.info(chat_model.invoke("你好，你是谁，能做什么？").content)

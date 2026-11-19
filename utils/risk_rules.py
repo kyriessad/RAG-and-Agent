@@ -10,13 +10,16 @@ https://www.nhs.uk/conditions/stroke/symptoms/
 不根据单个词诊断病因，也不宣称所有词表命中都是临床急症。
 https://www.nhs.uk/symptoms/chest-pain/
 https://www.nhs.uk/symptoms/shortness-of-breath/
+中国大陆院前急救电话依据国家卫健委的院前医疗急救管理办法说明。
+https://www.nhc.gov.cn/zwgk/jdjd/201312/bc9bb227a17d4622b0bb91bfbf934f58.shtml
 文字识别是有限的中文词表和否定过滤，不是完整的自然语言理解。
 """
 
 import re  # 只用于拆分患者原话、寻找明确数值和固定词，不依赖外部服务。
+from utils.pressure_numbers import NUMBER, PRESSURE_PAIR, pressure_number
 
 
-RULE_VERSION = "followup-risk-v1"  # 保存到记录中，便于解释当时采用哪版规则。
+RULE_VERSION = "followup-risk-v2"  # 支持中文明确读数；已提交记录保留原规则版本。
 SYSTOLIC_LIMIT = 180  # 单位 mmHg；等于边界也提醒，不自动诊断高血压急症。
 DIASTOLIC_LIMIT = 120  # 小压单独达到边界也触发，不要求两个数值同时超限。
 
@@ -36,6 +39,43 @@ RED_FLAGS = (
     )),
     ("vision_change", "出现突发视力变化相关描述", ("突然视物模糊", "突然看不清", "突然视力下降")),
 )
+
+# 普通不适只展示联系方式，不改变报告风险等级或触发红旗告警。
+DISCOMFORT = re.compile(
+    r"不舒服|不太舒服|不适|难受|不得劲|头晕|头昏|眩晕|晕乎|眼花|头痛|头疼|"
+    r"心慌|心悸|心跳很快|心跳得快|胸闷|气短|恶心|想吐|呕吐|乏力|没劲|"
+    r"(?:胸口|心口|肚子|胃|后背)(?:有点|有些|很)?(?:闷|疼|痛)"
+)
+
+
+def reports_discomfort(message):
+    """在本轮原话中识别不适自述，沿用红旗规则中的人称、时态与否定范围。"""
+    for clause in split_clauses(message):
+        if any(phrase in clause for phrase in ("哪些不适", "哪些症状", "会导致", "会引起", "有什么副作用")):
+            continue
+        for match in DISCOMFORT.finditer(clause):
+            before = clause[:match.start()]
+            if re.search(r"(?:没|未|不再)(?:有|有过|感觉|觉得|觉得有|什么|啥|任何|怎么|明显的?)?$", before):
+                continue
+            if before.endswith(("会", "会不会")) and clause.endswith(("吗", "么")):
+                continue
+            if is_positive_mention(clause, match.start(), match.end()):
+                return True
+    return False
+
+
+def patient_chat_notice(message):
+    """返回需要立即展示的患者提示。普通问答与明确否认不适返回 None。"""
+    risk = evaluate_risk(message=message)
+    if risk["level"] == "high":
+        return risk
+    if reports_discomfort(message):
+        return {
+            "level": "attention",
+            "patient_message": "你提到身体不舒服，请及时联系医生或就近就医。如果出现胸痛、呼吸困难或说话不清，请立即拨打中国大陆急救电话 120，不要等待在线回复。",
+            "reasons": [],
+        }
+    return None
 
 
 def split_clauses(text):
@@ -153,20 +193,22 @@ def check_text(result, text):
                     if is_positive_mention(clause, match.start(), match.end()):
                         add_reason(result, code, reason)
         # 成对数字需有血压/测量语境，或整句本身仅为 190/120，避免误读其他比值。
-        for match in re.finditer(r"(?<![\d.])(\d{2,3})\s*[/／]\s*(\d{2,3})(?![\d.])", clause):
+        for match in PRESSURE_PAIR.finditer(clause):
             before = clause[:match.start()]
-            has_context = bool(re.search(r"血压|大压|高压|刚量|测量|量了|测了", before))
-            if re.fullmatch(r"\d{2,3}\s*[/／]\s*\d{2,3}\s*(?:mmHg)?", clause, flags=re.IGNORECASE):
+            has_context = bool(re.search(r"血压|大压|高压|刚量|刚测|测量|量了|测了|量完|测完", before))
+            if match.start() == 0 and clause[match.end():].strip().lower() in ("", "mmhg"):
                 has_context = True
             if has_context and is_positive_mention(clause, match.start(), match.end()):
-                check_pressure(result, int(match.group(1)), int(match.group(2)))
+                high, low = (pressure_number(token) for token in match.groups())
+                if high is not None and low is not None:
+                    check_pressure(result, high, low)
         # 单独上报其中一项也及时检查；数值不推断另一项，不保存成草稿。
         pressure_words = (("收缩压|高压|大压", "high"), ("舒张压|低压|小压", "low"))
         for labels, kind in pressure_words:
-            pattern = r"(?:" + labels + r")\s*(?:是|为|有|达到|到了|测得|[:：])?\s*(\d{2,3})(?![\d.])"
+            pattern = r"(?:" + labels + r")\s*(?:是|为|有|达到|到了|测得|[:：])?\s*(" + NUMBER + ")"
             for match in re.finditer(pattern, clause):
                 if is_positive_mention(clause, match.start(), match.end()):
-                    value = int(match.group(1))
+                    value = pressure_number(match.group(1))
                     if kind == "high":
                         check_pressure(result, value, None)
                     else:
@@ -209,10 +251,10 @@ def evaluate_risk(data=None, message=None):
                 symptoms_known = False  # 有真实红旗时下方仍优先 high；否则保持信息不足。
     if result["rule_codes"]:
         result["level"] = "high"
-        result["patient_message"] = "血压数值触发及时联系医生的提醒。请尽快联系医生核对；如同时有胸痛、呼吸困难、说话不清等不适，请立即就医或联系当地急救服务，不要等待在线回复。不要自行调整药物。"
+        result["patient_message"] = "请尽快联系医生核对本次血压。如同时有胸痛、呼吸困难或说话不清，请立即拨打中国大陆急救电话 120，不要等待在线回复。"
         for code in result["rule_codes"]:
             if code not in ("systolic_ge_180", "diastolic_ge_120"):
-                result["patient_message"] = "你描述了需要及时处理的不适。请立即就医或联系当地急救服务，不要等待随访报告或在线回复。不要自行调整药物。"
+                result["patient_message"] = "你描述了需要立即就医的不适。请立即拨打中国大陆急救电话 120，不要等待随访报告或医生回复。"
                 break
     elif (data.get("bp_measurement_status") == "measured"
           and type(high) is int and type(low) is int and 0 < low < high <= 999

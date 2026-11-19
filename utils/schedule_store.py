@@ -1,4 +1,4 @@
-"""首轮随访排期、开放和逾期通知；只读写本地业务库，不调用模型。"""
+"""出院后第 7、14、30 天的随访排期、开放和逾期通知。"""
 
 from contextlib import closing
 from datetime import date, datetime, time, timedelta, timezone
@@ -10,6 +10,7 @@ from utils.user_store import get_connection
 
 BEIJING = timezone(timedelta(hours=8))  # 业务约定以北京时间的日历日期排期。
 OPEN_HOUR = 9
+FOLLOWUP_DAYS = (7, 14, 30)
 FILL_WINDOW = timedelta(hours=48)
 TIME_FORMAT = "%Y-%m-%d %H:%M:%S"  # SQLite 内统一用本地时间，固定宽度可直接比较。
 
@@ -48,36 +49,118 @@ def migrate_schedule():
             conn.execute("ALTER TABLE followup_tasks ADD COLUMN window_revision INTEGER NOT NULL DEFAULT 0")
 
 
-def plan_new_discharges(conn):
-    """在扫描事务里为新出院记录添加第七天任务，返回新增项数；缺医生留待下轮，日期错误单独记录。"""
+def plan_new_discharges(conn, discharge_id=None):
+    """在调用方事务内补齐自动排期，只新增缺少的轮次，保留已有任务的医生、状态和日期。"""
     rows = conn.execute(
         """SELECT h.discharge_id,h.discharge_date,p.doctor_id
            FROM discharges h JOIN patients p ON p.patient_id=h.patient_id
            JOIN doctors d ON d.doctor_id=p.doctor_id
            JOIN users du ON du.user_id=d.user_id AND du.role='doctor'
            JOIN users pu ON pu.user_id=p.user_id AND pu.role='patient'
-           WHERE h.auto_schedule=1 AND NOT EXISTS
-             (SELECT 1 FROM followup_tasks t WHERE t.discharge_id=h.discharge_id AND t.task_type='D7')"""
+           WHERE h.auto_schedule=1 AND (? IS NULL OR h.discharge_id=?)
+             AND NOT EXISTS (SELECT 1 FROM followup_tasks legacy
+                             WHERE legacy.discharge_id=h.discharge_id AND legacy.scheduled_at IS NULL)
+             AND (SELECT COUNT(*) FROM followup_tasks t WHERE t.discharge_id=h.discharge_id
+                  AND t.task_type IN ('D7','D14','D30')) < ?""",
+        (discharge_id, discharge_id, len(FOLLOWUP_DAYS)),
     ).fetchall()
     count = 0
     for row in rows:
         try:
             discharged = date.fromisoformat(row["discharge_date"])  # 出院当天为第 0 天。
-            day_seven = discharged + timedelta(days=7)
-            scheduled = datetime.combine(day_seven, time(OPEN_HOUR), BEIJING)
-            expected_deadline = scheduled + FILL_WINDOW
+            plan = []
+            for elapsed in FOLLOWUP_DAYS:
+                day = discharged + timedelta(days=elapsed)
+                scheduled = datetime.combine(day, time(OPEN_HOUR), BEIJING)
+                expected_deadline = scheduled + FILL_WINDOW
+                plan.append((str(uuid4()), row["discharge_id"], row["doctor_id"], f"D{elapsed}",
+                             day.isoformat(), scheduled.strftime(TIME_FORMAT), expected_deadline.strftime(TIME_FORMAT)))
         except (TypeError, ValueError, OverflowError):
             logging.getLogger(__name__).warning("出院日期无法排期，记录编号 %s", row["discharge_id"])
             continue  # 一条坏日期不阻碍其他患者；修正后下一轮会重新处理。
-        conn.execute(
+        cursor = conn.executemany(
             """INSERT INTO followup_tasks(task_id,discharge_id,doctor_id,task_type,followup_date,
                                           scheduled_at,window_revision,expires_at)
-               VALUES(?,?,?,'D7',?,?,1,?)""",
-            (str(uuid4()), row["discharge_id"], row["doctor_id"], day_seven.isoformat(),
-             scheduled.strftime(TIME_FORMAT), expected_deadline.strftime(TIME_FORMAT)),
+               VALUES(?,?,?,?,?,?,1,?) ON CONFLICT(discharge_id,task_type) DO NOTHING""",
+            plan,
         )  # 原表要求截止时间非空；任务实际开放时再按实际时钟写入完整的 48 小时。
-        count += 1
+        count += cursor.rowcount
     return count
+
+
+class DischargeConflict(Exception):
+    """同一登记编号已用于另一份内容；由接口返回冲突，不覆盖出院记录。"""
+
+
+def register_discharge(user_id, patient_id, request_id, discharge_date, diagnosis, instructions=None, medications=None):
+    """根据登录医生、患者及表单 UUID 保存出院记录和三轮随访。成功返回出院编号与计划时间。
+
+    同一表单重试返回原回执，无主管关系返回 None，内容冲突或日期无法排期则抛错并回滚。
+    只读写本地库。开放与通知仍由定时扫描按北京时间处理。
+    """
+    # 请求 UUID 同时构造稳定的出院主键，掉线后用原表单重试仍指向同一次住院。
+    discharge_id = "DIS-" + str(request_id)
+    day = discharge_date.isoformat()
+    with closing(get_connection()) as conn, conn:
+        conn.execute("BEGIN IMMEDIATE")  # 同时到达的重试、定时扫描或改派必须依次完成。
+        primary = conn.execute(
+            """SELECT d.doctor_id FROM patients p JOIN doctors d ON p.doctor_id=d.doctor_id
+               JOIN users du ON du.user_id=d.user_id AND du.role='doctor'
+               JOIN users pu ON pu.user_id=p.user_id AND pu.role='patient'
+               WHERE p.patient_id=? AND d.user_id=?""", (patient_id, user_id),
+        ).fetchone()
+        if primary is None:
+            return None  # 已参与历史任务的医生也必须有当前主管关系才能登记。
+        details = (patient_id, day, diagnosis, instructions, medications)
+        previous = conn.execute(
+            """SELECT patient_id,discharge_date,discharge_diagnosis,discharge_instructions,discharge_medications
+               FROM discharges WHERE discharge_id=?""",
+            (discharge_id,),
+        ).fetchone()
+        if previous is None:
+            conn.execute(
+                """INSERT INTO discharges(discharge_id,patient_id,discharge_date,discharge_diagnosis,
+                                          discharge_instructions,discharge_medications)
+                   VALUES(?,?,?,?,?,?)""", (discharge_id, *details),
+            )
+        elif tuple(previous) != details:
+            raise DischargeConflict("该登记编号已提交其他内容，请核对患者档案。")
+        plan_new_discharges(conn, discharge_id)  # 仅为这条新出院登记排期，重试会跳过已有任务。
+        tasks = conn.execute(
+            """SELECT task_type,scheduled_at FROM followup_tasks WHERE discharge_id=?
+               AND task_type IN ('D7','D14','D30') ORDER BY followup_date""", (discharge_id,),
+        ).fetchall()
+        if len(tasks) != len(FOLLOWUP_DAYS):
+            raise ValueError("出院日期超出可排期范围，请核对日期。")  # 避免留下已登记却无法排期的记录。
+        return {"discharge_id": discharge_id, "scheduled_at": tasks[0]["scheduled_at"],
+                "schedule": [dict(task) for task in tasks]}
+
+
+def supplement_discharge(user_id, patient_id, discharge_id, changes):
+    """主管医生补充可见出院记录中的空项；同一内容可重试，已有处方保持原文。"""
+    with closing(get_connection()) as conn, conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            """SELECT h.discharge_instructions,h.discharge_medications
+               FROM discharges h JOIN patients p ON p.patient_id=h.patient_id
+               JOIN doctors d ON d.doctor_id=p.doctor_id
+               JOIN users du ON du.user_id=d.user_id AND du.role='doctor'
+               WHERE h.patient_id=? AND h.discharge_id=? AND du.user_id=?
+                 AND EXISTS (SELECT 1 FROM followup_tasks t
+                             WHERE t.discharge_id=h.discharge_id AND t.doctor_id=d.doctor_id)""",
+            (patient_id, discharge_id, user_id),
+        ).fetchone()
+        if row is None:
+            return False
+        for field, value in changes.items():
+            if row[field] and row[field].strip() and row[field] != value:
+                raise DischargeConflict("该项已有记录，请刷新档案核对。")
+        conn.execute(
+            """UPDATE discharges SET discharge_instructions=?,discharge_medications=? WHERE discharge_id=?""",
+            (changes.get("discharge_instructions", row["discharge_instructions"]),
+             changes.get("discharge_medications", row["discharge_medications"]), discharge_id),
+        )
+        return True
 
 
 def save_notice(conn, kind, task_id, revision, recipient, message, created_at):
@@ -107,14 +190,17 @@ def scan_schedule(now=None):
             JOIN users pu ON pu.user_id=p.user_id AND pu.role='patient'
             JOIN users du ON du.user_id=d.user_id AND du.role='doctor'"""
         rows = conn.execute(
-            "SELECT t.task_id,t.window_revision,p.user_id AS patient " + assignments +
+            "SELECT t.task_id,t.task_type,t.window_revision,p.user_id AS patient,p.name,d.user_id AS doctor " + assignments +
             " WHERE t.scheduled_at<=? AND t.opened_at IS NULL AND t.task_status='pending'", (stamp,),
         ).fetchall()
         for row in rows:
             task_id = row["task_id"]
             conn.execute("UPDATE followup_tasks SET opened_at=?,expires_at=? WHERE task_id=?", (stamp, deadline, task_id))
-            message = "出院后首次随访已开放，请在" + deadline + "前完成填写。"
-            save_notice(conn, "opened", task_id, row["window_revision"], row["patient"], message, stamp)
+            description = f"出院后第 {row['task_type'][1:]} 天的随访已开放"
+            save_notice(conn, "opened", task_id, row["window_revision"], row["patient"],
+                        description + "，请在 " + deadline + " 前完成填写。", stamp)
+            save_notice(conn, "opened", task_id, row["window_revision"], row["doctor"],
+                        row["name"] + description + "，已提醒患者填写。", stamp)
             result["opened"] += 1  # 开放与通知一起提交，进程中断后也可重试。
         late_rows = conn.execute(
             "SELECT t.task_id,t.window_revision,p.user_id AS patient,p.name,d.user_id AS doctor " + assignments +
