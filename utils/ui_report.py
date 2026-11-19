@@ -52,7 +52,7 @@ def display_report(content):
 
 
 # 绘制医生草稿或患者终稿，标题由调用方根据状态提供
-def show_report_sheet(view, title):
+def show_report_sheet(view, title, key_suffix=""):
     # 只作用于报告单，正文自动折行，手机可上下阅读；背景叠加透明色以适应深色主题。
     st.html("""
     <style>
@@ -73,10 +73,10 @@ def show_report_sheet(view, title):
       .st-key-report_review_actions { border-radius: 14px; }
     </style>
     """)
-    with st.container(key="report_sheet", border=True):
+    with st.container(key="report_sheet" + key_suffix, border=True):
         st.subheader(title)
         # 当次负责医生由报告快照或可核实的历史登记给出，与当前任务联系人分别展示。
-        with st.container(key="report_byline", gap="xxsmall"):
+        with st.container(key="report_byline" + key_suffix, gap="xxsmall"):
             st.write("本次负责医生", report_doctor_label(view.get("responsible_doctor"),
                                                     view.get("responsible_doctor_source")))
             if view.get("reviewer"):
@@ -93,7 +93,7 @@ def show_report_sheet(view, title):
 
 
 # 展示一个任务的报告进度。
-def show_report_workflow(token, task_id, doctor=False):
+def show_report_workflow(token, task_id, doctor=False, intent=None):
     # 同一任务的 GET、生成和审核操作共用此前缀，例如 /tasks/F001/report。
     path = f"/tasks/{task_id}/report"
     try:
@@ -122,7 +122,7 @@ def show_report_workflow(token, task_id, doctor=False):
             # 仅在接口确实返回 content 时显示正文。发布前患者响应里没有这个字段。
             if "content" in view:
                 show_report_sheet(view, "我的最终随访报告")
-                if st.button("返回我的随访", key="report_back_home"):
+                if st.button("返回总对话", key="report_back_home"):
                     go_home()
             # 已通过但尚未发布时也走等待分支，医生仍需点击发布按钮。
             elif view["task_status"] == "in_review":
@@ -158,26 +158,39 @@ def show_report_workflow(token, task_id, doctor=False):
         payload = {"report_id": view["report_id"], "expected_version": view["version"]}
         # key 包含账号、报告和版本。换患者或另一位医生登录时，不能沿用之前的审核输入。
         key = f"{st.session_state['user']['user_id']}_{view['report_id']}_{view['version']}"
+        fields = {}
+        if intent and intent.get("fields"):
+            if (intent.get("report_id"), intent.get("expected_version")) == (view["report_id"], view["version"]):
+                fields = intent.get("fields") or {}
+                key += "_" + intent["card_key"]
+            else:
+                panel.info("报告版本已更新，请依据当前报告重新核对。")
         if view["status"] == "pending_review":
             # 四种动作中的前三种用于审核；发布只会在服务端返回 approved 后出现。
             options = {"通过": "approve", "修改后通过": "edit", "退回补充": "return"}
             panel.subheader("审核决定")
-            choice = panel.radio("审核操作", list(options), key="choice_" + key)
+            action = fields.get("action")
+            choice = panel.radio("审核操作", list(options),
+                                 index=list(options.values()).index(action) if action in options.values() else 0,
+                                 key="choice_" + key)
             payload["action"] = options[choice]  # 例如“退回补充”提交给 API 的 action 是 return。
             if choice == "修改后通过":
                 # 编辑器初值取数据库内原摘要，医生可直接更正和补充本次情况。
-                payload["summary"] = panel.text_area("修改后的摘要", view["content"]["summary"],
+                payload["summary"] = panel.text_area("修改后的摘要", fields.get("summary") or view["content"]["summary"],
                                                   max_chars=8000, key="summary_" + key)
                 # 一行代表一个关注项；写回列表保留条目界限，空行会略过。
-                points = panel.text_area("需关注情况（每行一项）", "\n".join(view["content"]["abnormal_points"]),
-                                      key="points_" + key)
+                initial_points = fields.get("abnormal_points")
+                if initial_points is None:
+                    initial_points = view["content"]["abnormal_points"]
+                points = panel.text_area("需关注情况（每行一项）", "\n".join(initial_points), key="points_" + key)
                 payload["abnormal_points"] = []
                 for line in points.splitlines():
                     if line.strip():
                         payload["abnormal_points"].append(line.strip())
                 payload["keep_sources"] = []  # 保留建议及其对应引用一起提交，不能改写知识库原文。
                 for number, source in enumerate(view["content"]["sources"], 1):
-                    if panel.checkbox(f"保留建议〔{number}〕 {source['quote']}", value=True,
+                    if panel.checkbox(f"保留建议〔{number}〕 {source['quote']}",
+                                   value=fields.get("keep_sources") is None or number in fields["keep_sources"],
                                    key=f"keep_{key}_{number}"):
                         payload["keep_sources"].append(number)
             note_label = "给患者的审核意见（选填）"
@@ -187,7 +200,7 @@ def show_report_workflow(token, task_id, doctor=False):
                 button_label = "退回给患者补充"
             elif choice == "修改后通过":
                 button_label = "保存修改并通过"
-            payload["note"] = panel.text_area(note_label, max_chars=2000, key="note_" + key)
+            payload["note"] = panel.text_area(note_label, value=fields.get("note") or "", max_chars=2000, key="note_" + key)
             if panel.button(button_label, key="review_" + key, type="primary", width="stretch"):
                 # 必填项留空时在决定区提示，保留其他填写内容，不发送无效审核。
                 if choice == "退回补充" and not payload["note"].strip():

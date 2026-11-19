@@ -7,6 +7,7 @@ from contextlib import closing
 from uuid import uuid4
 
 from utils.user_store import get_connection
+from utils.chat_store import save_receipt
 
 
 def migrate_risk_notifications():
@@ -166,6 +167,8 @@ def handle_doctor_notification(user_id, role, notice_id):
         if row["handled_at"] is None:
             conn.execute("UPDATE notifications SET handled_at=CURRENT_TIMESTAMP WHERE id=?", (notice_id,))
             row = conn.execute(scoped_notice, params).fetchone()
+        save_receipt(conn, user_id, role, "handle_risk", notice_id, "风险提醒已标记为已处理。",
+                     patient_id=row["patient_id"], task_id=row["task_id"], notice_id=notice_id, handled_at=row["handled_at"])
         return dict(row)
 
 

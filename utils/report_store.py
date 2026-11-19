@@ -12,6 +12,7 @@ from utils import schedule_store
 from utils.followup_store import doctor_card, report_assignment
 from utils.logger_handler import logger
 from utils.user_store import get_connection
+from utils.chat_store import save_receipt
 
 
 class ReportError(Exception):
@@ -199,6 +200,8 @@ def generate_report(user, task_id, record_id):
         conn.execute("UPDATE followup_tasks SET task_status='in_review' WHERE task_id=?", (task_id,))
         # 记录是哪位账号触发生成、关联的正式记录是什么，便于事后追溯。
         audit(conn, user, task_id, report_id, "report_generated", {"record_id": record_id})
+        save_receipt(conn, user["user_id"], user["role"], "generate", record_id, "随访报告已生成，等待医生审核。",
+                     task_id=task_id, record_id=record_id)
     return receipt
 
 
@@ -298,4 +301,8 @@ def review_report(user, task_id, request):
             schedule_store.reset_return_window(conn, task_id)
         audit(conn, user, task_id, request.report_id, "report_" + action,
               {"request": request.model_dump(), "original_content": details.get("original_content")})
+        actions = {"approve":"审核已通过，等待发布。", "edit":"报告修改已保存并审核通过，等待发布。",
+                   "return":"报告已退回，等待患者补充。", "publish":"报告已发布给患者。"}
+        save_receipt(conn, user["user_id"], user["role"], action, f"{request.report_id}:{request.expected_version}",
+                     actions[action], task_id=task_id, **receipt)
     return receipt

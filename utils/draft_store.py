@@ -210,7 +210,7 @@ def get_task_draft(user_id, role, task_id):
         conn.close()  # 只读事务随连接关闭，不产生业务写入。
 
 
-def save_task_draft(user_id, role, task_id, expected_revision, data):
+def save_task_draft(user_id, role, task_id, expected_revision, data, *, on_save=None):
     """验证并保存完整采集草稿，返回新版本；必要时保存风险通知，但不正式提交随访。
 
     输入旧版本 0，首次成功返回版本 1。越权抛 PermissionError；
@@ -245,6 +245,8 @@ def save_task_draft(user_id, role, task_id, expected_revision, data):
         risk = evaluate_risk(data=data)  # 手工和 Agent 草稿都必须经过同一套独立风险规则。
         save_risk_notification(conn, user_id, task_id, risk, "采集草稿，尚未经确认提交")
         alerts = list_task_risk_alerts(conn, task_id)  # 查询本事务刚写入的通知，随草稿一起交给页面。
+        if on_save is not None:
+            on_save(conn, revision)  # 对话产生的草稿与对应的完整回答在同一事务确认。
         conn.commit()  # 草稿与必要通知一起保存；不改变 followup_tasks/followup_records。
         return {"task_id": task_id, "revision": revision, "data": data, "returned_draft": False,
                 "missing_fields": missing, "notes": stored_draft_notes(stored, data), "editable": True,

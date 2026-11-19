@@ -8,6 +8,7 @@ from utils.draft_store import confirmed_record_id, missing_draft_fields, read_dr
 from utils.risk_rules import evaluate_risk
 from utils.risk_store import save_risk_notification
 from utils.user_store import get_connection
+from utils.chat_store import save_receipt
 
 
 class SubmitDraftData(BaseModel):
@@ -92,6 +93,8 @@ def submit_task_draft(user_id, role, task_id, expected_revision, confirmed):
                VALUES(?,?,'followup_submitted',?,CURRENT_TIMESTAMP)""", (user_id, task_id, details),
         )  # 审计、状态、正式记录必须一起成功，不能只留下其中一部分。
         save_risk_notification(conn, user_id, task_id, risk, "患者确认提交")  # 高风险时同事务保存医生通知。
+        save_receipt(conn, user_id, role, "submit", record_id, "随访信息已提交，等待医生审核。",
+                     task_id=task_id, record_id=record_id, draft_revision=expected_revision)
         conn.commit()
         return submission_result(task_id, record_id, revision, expected_revision, "submitted", risk, False)
     except Exception:

@@ -1,6 +1,5 @@
-from typing import Any
+from typing import Any, Literal
 
-# @tool 把普通 Python 函数注册成模型可选择的工具，描述会进入工具清单。
 from langchain_core.tools import tool
 # ToolRuntime 由框架提供，其中的 context 保存后端已核对的身份。
 from langchain.tools import ToolRuntime
@@ -8,12 +7,11 @@ from langchain.tools import ToolRuntime
 from utils.draft_store import DraftFields
 # 校验依据来自本次任务内的患者原话，提议本身仅在内存中保存。
 from agent.tools.draft_collection import propose_draft_changes
+from agent.tools import workspace_cards
 
 from rag.rag_service import RagService
 # 三种医疗查询共用数据库授权逻辑，传给模型的结果已经过筛选。
 from utils.followup_store import (
-    list_patients,
-    list_followup_tasks,
     list_discharges,
     list_recent_records,
 )
@@ -26,14 +24,15 @@ from utils.risk_store import patient_doctor_contact
 rag = RagService()
 
 
-@tool(description="查询当前授权范围内的患者基本资料与医患关系；患者查询本轮随访医生或主管医生电话时使用")
-def get_related_people(runtime: ToolRuntime[Any]) -> list[dict]:
+@tool(description="查授权患者名册、患者档案、医患关系或医生电话；医生可按患者姓名筛选")
+def get_related_people(runtime: ToolRuntime[Any], patient_name: str = "") -> list[dict]:
     """读取服务端选定范围内的医患资料；无档案时返回 []。只读，不接受姓名作授权参数。"""
     context = runtime.context
-    profiles = list_patients(context["user_id"], context["role"],
-                             patient_id=context.get("patient_id"), task_id=context.get("task_id"))
+    profiles = workspace_cards.selected_people(context, patient_name)
     if profiles and context["role"] == "patient":
         profiles[0]["doctor_contact"] = patient_doctor_contact(context["user_id"], context.get("task_id"))
+    if context["role"] == "doctor":
+        workspace_cards.add_cards(context, [workspace_cards.card("patient", p, "age", "gender") for p in profiles])
     return profiles
 
 
@@ -41,62 +40,69 @@ def get_related_people(runtime: ToolRuntime[Any]) -> list[dict]:
 def get_current_report(runtime: ToolRuntime[Any]) -> dict:
     """输入服务端任务上下文，返回与页面相同的报告视图。只读，越权时由存储层拒绝。"""
     context = runtime.context
-    return report_view(context, context["task_id"])
+    view = report_view(context, context["task_id"])
+    item = workspace_cards.card("report", context)
+    if view.get("report_id"):
+        item.update(report_id=view["report_id"], expected_version=view["version"])
+    workspace_cards.add_cards(context, [item])
+    return view
 
 
-@tool(description="查询当前患者自己的随访任务；医生查询分配给自己的任务；已进入任务时仅返回当前任务")
-def get_my_followup_tasks(runtime: ToolRuntime[Any]) -> list[dict]:
-    """输入后端运行上下文，输出授权任务字典列表；无记录返回 []。
-
-    例如 context 中 task_id="F001"，只读取 F001，不读取同账号的其他任务。
-    本工具只读数据库；查询失败交给外层工具监控处理。
-    """
-    # runtime 由 Agent 框架注入，不是模型需要填写的工具参数。
-    # context 是后端提供的字典，例如 {"user_id": "U001", "role": "patient", "task_id": "F001"}。
-    return list_followup_tasks(
-        # 例如 U001 来自登录会话，工具参数中没有可供模型填写的用户名。
-        user_id=runtime.context["user_id"],
-        # patient 与 doctor 会在同一查询中匹配不同的归属条件。
-        role=runtime.context["role"],
-        task_id=runtime.context.get("task_id"),  # 未进入任务时为 None，保留原查询方式。
-        patient_id=runtime.context.get("patient_id"),  # 医生打开某人的档案后仅查询该患者。
-    )
+@tool(description="查询随访计划（包括尚未开放的安排）、任务进度或医生待办，附上对应任务卡")
+def get_my_followup_tasks(runtime: ToolRuntime[Any], selection: Literal["all", "review", "overdue"] = "all",
+                          patient_name: str = "") -> list[dict] | dict:
+    """review 选取待整理、审核、发布的任务；overdue 选择逾期任务；可按患者姓名收窄。"""
+    return workspace_cards.task_cards(runtime.context, selection, patient_name)
 
 
-@tool(description="查询授权的出院信息；已进入任务时仅查询当前任务对应的出院记录")
-def get_my_discharges(runtime: ToolRuntime[Any]) -> list[dict]:
-    """输入后端身份与任务范围，输出出院信息列表；无记录返回 []。
-
-    例如 task_id="F001"，只返回该任务对应的出院信息，不混入其他住院记录。
-    本工具只读数据库，不根据用户在聊天里提供的编号改变范围。
-    """
-    # 身份取自登录上下文；聊天中出现的姓名、编号不能扩大查询范围。
-    return list_discharges(
-        # 数据库将登录账号关联到患者或负责医生，姓名不是查询授权凭证。
-        user_id=runtime.context["user_id"],
-        # 结合下一行的任务编号，只查看本次任务所属的出院记录。
-        role=runtime.context["role"],
-        task_id=runtime.context.get("task_id"),  # 由服务器限定关联的出院记录。
-        patient_id=runtime.context.get("patient_id"),
-    )
+@tool(description="查已发布最新报告或指定报告的内容、原文引用、进度并提供报告卡。latest 只用于用户明确询问最新一份")
+def read_followup_reports(runtime: ToolRuntime[Any], patient_name: str = "", task_id: str = "",
+                          latest: bool = False) -> dict:
+    return workspace_cards.reports(runtime.context, patient_name, task_id, latest, "", "", "")
 
 
-@tool(description="查询获授权的最近20条随访记录，按提交时间倒序；已进入任务时仅查询当前任务的记录")
-def get_my_recent_records(runtime: ToolRuntime[Any]) -> list[dict]:
-    """输入后端身份与任务范围，输出最多 20 条随访记录；无记录返回 []。
+@tool(description="查当前授权范围内的到期、逾期、退回补充等随访提醒")
+def get_followup_reminders(runtime: ToolRuntime[Any]) -> list[dict]:
+    return workspace_cards.notifications(runtime.context, "schedule")
 
-    例如 task_id="F001"，返回的每条记录都属于 F001，并保留 record_id/revision。
-    本工具只读数据库，不提交数据；查询异常由外层工具监控处理。
-    """
-    # 返回已提交的原始记录，不返回待审核报告或医生审核意见。
-    return list_recent_records(
-        # 即便同名患者也用不同 user_id 区分；不会因聊天自报姓名扩大权限。
-        user_id=runtime.context["user_id"],
-        # 医生读取的是分配给自己的任务记录，患者读取自己的记录。
-        role=runtime.context["role"],
-        task_id=runtime.context.get("task_id"),  # 限定当前任务，不能把其他任务的记录混进来。
-        patient_id=runtime.context.get("patient_id"),
-    )
+
+@tool(description="医生查风险通知并展示处理卡；默认返回未处理的通知，status=all 查看全部")
+def get_risk_notifications(runtime: ToolRuntime[Any], status: Literal["unhandled", "handled", "all"] = "unhandled") -> list[dict]:
+    return workspace_cards.notifications(runtime.context, "risk", status)
+
+
+@tool(description="预填医生的登记出院或补充医嘱用药核对卡。字段逐字摘录原话，明确另登记一次住院时 new_registration=true")
+def prepare_discharge(runtime: ToolRuntime[Any], operation: Literal["register_discharge", "supplement_discharge"],
+                      patient_name: str = "", discharge_date: str = "", discharge_diagnosis: str = "",
+                      discharge_instructions: str = "", discharge_medications: str = "", discharge_id: str = "",
+                      new_registration: bool = False) -> dict:
+    """字段摘录医生原话；根据 missing 追问。明确要另登记一次新的住院时 new_registration=true。"""
+    fields = {"discharge_date": discharge_date, "discharge_diagnosis": discharge_diagnosis,
+              "discharge_instructions": discharge_instructions, "discharge_medications": discharge_medications}
+    return workspace_cards.discharge_cards(runtime.context, operation, patient_name, discharge_id, fields, new_registration)
+
+
+@tool(description="医生提出审核通过、修改后通过、退回或发布时，生成待人工确认的报告卡")
+def prepare_report_review(runtime: ToolRuntime[Any], action: Literal["approve", "edit", "return", "publish"],
+                          patient_name: str = "", task_id: str = "", note: str = "", summary: str = "") -> dict:
+    """note 是医生原话中的审核意见；summary 是医生明确指定的修改后摘要。发布单独确认。"""
+    return workspace_cards.reports(runtime.context, patient_name, task_id, False, action, note, summary)
+
+
+@tool(description="查授权出院记录中的出院日期、诊断、医嘱、用药；医生按患者全名筛选")
+def get_my_discharges(runtime: ToolRuntime[Any], patient_name: str = "") -> list[dict] | dict:
+    context, choices = workspace_cards.patient_scope(runtime.context, patient_name)
+    if choices is not None:
+        return choices
+    return workspace_cards.visible_rows(context, list_discharges)
+
+
+@tool(description="查询获授权的最近20条随访记录，按提交时间倒序；医生按患者全名筛选")
+def get_my_recent_records(runtime: ToolRuntime[Any], patient_name: str = "") -> list[dict] | dict:
+    context, choices = workspace_cards.patient_scope(runtime.context, patient_name)
+    if choices is not None:
+        return choices
+    return workspace_cards.visible_rows(context, list_recent_records)
 
 
 @tool(description="根据本次随访问答的含义提取字段，evidence 摘录患者原话。允许用本任务近期回答补空项；不正式提交。")

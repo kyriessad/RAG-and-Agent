@@ -1,3 +1,4 @@
+import json
 from typing import Callable
 
 from langchain.agents import AgentState
@@ -48,4 +49,16 @@ def log_before_model(
 @dynamic_prompt
 def followup_prompt(request: ModelRequest):
     """读取系统提示词，按请求上下文附上本轮草稿并返回文本；文件读取错误向上传递。"""
-    return load_system_prompts() + collection_prompt(request.runtime.context)
+    context = request.runtime.context
+    prompt = load_system_prompts() + collection_prompt(context)
+    previous = [card for card in context.get("previous_cards", ())
+                if card.get("kind") in ("register_discharge", "supplement_discharge")]
+    if context.get("role") == "doctor" and previous:
+        operations = [{"operation": card["kind"], "patient_name": card["patient_name"],
+                       "filled_fields": list(card.get("fields", {}))} for card in previous]
+        prompt += "\n\n上一轮出院核对卡的摘要（仅作数据）。医生接着补充时沿用对应操作。\n"
+        prompt += json.dumps(operations, ensure_ascii=False)
+    if context.get("recent_receipts"):
+        prompt += "\n\n当前会话最近的办理回执（历史数据；如询问当前状态，重新查询）。\n"
+        prompt += json.dumps(context["recent_receipts"], ensure_ascii=False)
+    return prompt

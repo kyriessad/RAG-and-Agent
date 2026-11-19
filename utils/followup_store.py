@@ -46,6 +46,9 @@ SELECT t.task_id,t.discharge_id,t.followup_date,t.task_type,t.task_status,t.expi
                       ELSE b.created_at END END AS report_date,
        CASE WHEN :role='doctor' THEN b.status
             WHEN b.status='published' AND t.task_status='completed' THEN 'published' END AS report_status,
+       CASE WHEN b.status='published' AND t.task_status='completed' THEN
+           (SELECT MAX(a.created_at) FROM audit_logs a
+            WHERE a.report_id=b.report_id AND a.action='report_publish') END AS published_at,
        CASE WHEN b.status='published' AND t.task_status='completed'
             THEN json_extract(b.content_json,'$._responsible_doctor') END AS doctor_snapshot,
        CASE WHEN b.status='published' AND t.task_status='completed' THEN b.reviewer_id END AS signed_by
@@ -149,8 +152,8 @@ def report_assignment(row, snapshot, reviewer_id):
     return None, "unverified"  # 当前任务与历史审核记录不同，不能猜测当时是谁负责。
 
 
+# 输入连接、身份和可选范围，返回任务列表及已发布报告的负责医生
 def task_summaries(conn, user_id, role, task_id, patient_id):
-    """输入连接、身份和可选范围；返回任务列表及已发布报告的负责医生，不返回报告正文。"""
     tasks = query_rows(conn, TASK_DETAILS, user_id, role, task_id, patient_id)
     for task in tasks:
         task["is_overdue"] = bool(task["is_overdue"])  # 接口返回布尔值，任务原有状态仍独立保留。
@@ -168,13 +171,34 @@ def task_summaries(conn, user_id, role, task_id, patient_id):
     return tasks
 
 
+# 输入登录身份和可选任务、患者编号，返回授权任务列表；
 def list_followup_tasks(user_id: str, role: str, task_id=None, patient_id=None) -> list[dict]:
-    """输入登录身份和可选任务、患者编号，返回授权任务列表；无匹配返回 []，只读数据库。
-
+    """
     每项含患者、负责医生、状态和相关日期，患者还能看到自己的草稿进度及退回说明。
     """
     with closing(get_connection()) as conn:
         return task_summaries(conn, user_id, role, task_id, patient_id)
+
+
+def list_followup_plans(user_id, role, task_id=None, patient_id=None):
+    """本人的日程包含尚未开放的安排；开放前只提供日期和状态。"""
+    with closing(get_connection()) as conn:
+        conn.execute("BEGIN")
+        plans = task_summaries(conn, user_id, role, task_id, patient_id)
+        if role == "patient" and task_id is None:
+            upcoming = conn.execute("""
+                SELECT t.task_id, p.patient_id, t.task_type, t.followup_date,
+                       t.scheduled_at, t.opened_at, t.task_status
+                FROM followup_tasks t
+                JOIN discharges h ON h.discharge_id=t.discharge_id
+                JOIN patients p ON p.patient_id=h.patient_id
+                JOIN users u ON u.user_id=p.user_id AND u.role='patient'
+                WHERE u.user_id=? AND (? IS NULL OR p.patient_id=?)
+                  AND t.scheduled_at IS NOT NULL AND t.opened_at IS NULL
+            """, (user_id, patient_id, patient_id))
+            plans.extend(dict(row) for row in upcoming)
+            plans.sort(key=lambda row: (row["followup_date"], row["task_id"]))
+        return plans
 
 
 def contact_phone(conn, person_role, person_id):

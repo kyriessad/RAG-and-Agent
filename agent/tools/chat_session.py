@@ -2,12 +2,14 @@
 # 这里有三种锁：全体会话目录、知识库首次同步、单次登录的推理。
 from threading import Lock
 from time import monotonic
+from contextlib import closing
 
 # 日志只记录工具名或错误类型，避免把患者整段聊天写到磁盘。
 from utils.logger_handler import logger
 # 每次推理前读取已保存草稿，推理后按旧版本尝试合并。
 from utils.draft_store import get_task_draft, save_task_draft
-from utils import followup_store
+from utils import chat_store
+from utils.user_store import get_connection
 from utils.risk_rules import patient_chat_notice
 # save_message_risk 在模型创建前可以独立提交通知。
 from utils.risk_store import patient_doctor_contact, save_message_risk
@@ -62,7 +64,7 @@ def forget_session(session_key):
         chat_sessions.pop(session_key, None)
 
 
-def stream_chat(session_key, user_id, role, message, task_id=None, patient_id=None, mode="query"):
+def stream_chat(session_key, user_id, role, message, task_id=None, patient_id=None, mode="query", request_id=None):
     """在已授权的任务范围内处理一条消息，逐个返回流式事件。
 
     输入：会话哈希、服务端身份、消息、患者和任务范围。mode 为 query 或 collect。
@@ -75,6 +77,18 @@ def stream_chat(session_key, user_id, role, message, task_id=None, patient_id=No
     """
     # 风险检查不占用模型会话锁；上一条消息还在回答时，新危险信息仍应先提醒。
     risk = patient_chat_notice(message) if role == "patient" else None
+    metadata = {}
+    turn_id = None
+    try:
+        turn_id, replay = chat_store.start_turn(user_id, role, patient_id, task_id, mode, message, request_id)
+        if replay is not None:
+            yield from replay
+            return
+    except (ValueError, PermissionError) as error:
+        yield {"type": "error", "content": str(error)}
+        return
+    except Exception as error:
+        logger.error("保存对话失败，错误类型：%s", type(error).__name__)
     if risk:
         notice = {"risk": dict(risk)}
         delivery_failed = False
@@ -96,11 +110,20 @@ def stream_chat(session_key, user_id, role, message, task_id=None, patient_id=No
                 except Exception as contact_error:
                     logger.error("医生联系方式读取失败，错误类型：%s", type(contact_error).__name__)
         notice["risk"]["patient_message"] += "\n\n" + contact
+        metadata["risk"] = notice
+        if turn_id is not None:
+            try:
+                chat_store.save_risk_event(turn_id, metadata)
+            except Exception as error:
+                logger.error("保存对话风险提示失败，错误类型：%s", type(error).__name__)
         yield {"type": "risk", "content": notice}
         if delivery_failed:
             yield {"type": "error", "content": "医生通知未能保存。请直接联系医生或及时就医，不要等待助手回复。"}
             return
 
+    if turn_id is None:
+        yield {"type": "error", "content": "对话记录暂时无法保存，请稍后重试。"}
+        return
     # monotonic() 是只向前走的计时值，用于清理一天没有使用的内存会话。
     now = monotonic()
     with sessions_lock:
@@ -138,14 +161,11 @@ def stream_chat(session_key, user_id, role, message, task_id=None, patient_id=No
                 return
         # 同一医生在同一档案中也可能失去某次任务权限。授权范围变化时清掉旧模型记忆。
         # 保存稳定编号而非病历正文，普通状态变化不打断正在追问的对话。
-        access = []
-        if task_id is None:
-            for person in followup_store.list_patients(user_id, role, patient_id=patient_id):
-                access.append(("patient", person["patient_id"], person["is_primary"]))
-            for task in followup_store.list_followup_tasks(user_id, role, patient_id=patient_id):
-                access.append(("task", task["task_id"], task["patient_id"], task["discharge_id"]))
-        scope = (user_id, role, patient_id, task_id, mode, sorted(access))
-        if session.get("scope") != scope:
+        draft_revision = draft["revision"] if draft is not None else None
+        access, recent = chat_store.recent_turns(user_id, role, patient_id, task_id, mode, turn_id, draft_revision)
+        scope = (user_id, role, patient_id, task_id, mode, access)
+        last_answer = recent[-1]["id"] if recent else None
+        if session.get("scope") != scope or session.get("last_answer") != last_answer:
             session["agent"] = None
             session["scope"] = scope
         if session["agent"] is None:
@@ -153,6 +173,8 @@ def stream_chat(session_key, user_id, role, message, task_id=None, patient_id=No
             yield {"type": "status", "content": "正在准备 Agent 和医学知识库……"}
             # 同时传入身份与任务范围，后续工具查询由这些服务端值限定。
             session["agent"] = create_chat_agent(user_id, role, task_id=task_id, patient_id=patient_id, mode=mode)
+            if recent and hasattr(session["agent"], "restore_history"):
+                session["agent"].restore_history(recent, draft_revision)
 
         # 普通查询沿用原签名；患者任务把最新草稿传入每一轮推理。
         if draft is None:
@@ -172,6 +194,8 @@ def stream_chat(session_key, user_id, role, message, task_id=None, patient_id=No
             elif event["type"] == "answer":
                 # 暂存完整 answer，等候选草稿通过版本检查后再发给页面。
                 answer = event
+            elif event["type"] in ("sources", "cards"):
+                metadata[event["type"]] = event["content"]
             else:
                 if event["type"] == "error":
                     # 设置失败标记，确保后面不会把本轮半成品写入 task_drafts。
@@ -183,17 +207,30 @@ def stream_chat(session_key, user_id, role, message, task_id=None, patient_id=No
                 yield {"type": "error", "content": "未收到完整回答，草稿未更新，请重试。"}
             return
         # 字段没有实际变化时不写新草稿版本，避免患者白白遇到版本冲突。
+        def finish(conn, revision):
+            chat_store.finish_turn(conn, user_id, role, turn_id, metadata, answer["content"], draft_revision, revision)
+
+        saved = None
         if draft is not None and proposal is not None and proposal != draft["data"]:
             try:
                 # 写事务重新核对身份、归属、状态和旧版本；不会覆盖另一个页面的新修改。
-                saved = save_task_draft(user_id, role, task_id, draft["revision"], proposal)
+                saved = save_task_draft(user_id, role, task_id, draft_revision, proposal, on_save=finish)
             except (PermissionError, RuntimeError, ValueError):
                 session["agent"] = None  # 提议没存成，不能让后续记忆把它当成成功。
                 yield {"type": "error", "content": "本轮草稿未保存：任务权限、状态或草稿内容已变化，请重新加载草稿后重试。"}
                 return
-            yield {"type": "draft", "content": saved}  # 页面只接收后端确认保存的新版本。
+        else:
+            with closing(get_connection()) as conn, conn:
+                conn.execute("BEGIN IMMEDIATE")
+                finish(conn, draft_revision)
+        session["last_answer"] = f"{turn_id}-a"
+        if saved is not None:
+            yield {"type": "draft", "content": saved}
+        for event_name in ("sources", "cards"):
+            if event_name in metadata:
+                yield {"type": event_name, "content": metadata[event_name]}
         # 页面收到 answer 后才把这一轮助手回答加入完成历史。
-        yield answer
+        yield {**answer, "message_id": session["last_answer"]}
     except GeneratorExit:
         # 页面中途断开时也丢弃未完成的推理记忆，下次从干净状态继续。
         session["agent"] = None

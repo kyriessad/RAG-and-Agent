@@ -82,6 +82,7 @@ def load_draft_fields(draft):
 # 清除页面登录信息。
 def clear_login():
     clear_draft_state()  # 清除草稿及输入框缓存，防止下一个账号看到旧内容。
+    clear_chat_state()
     # user={...} 保存账号字典；token="示例令牌" 保存登录凭证字符串；message=[...] 保存聊天消息列表。
     # agent 是旧版页面留下的键。当前版本的 Agent 对象在后端，本页面不再创建它。
     # 退出或登录过期时，一起清掉身份、令牌和页面里的聊天历史。
@@ -95,6 +96,19 @@ def clear_login():
 
 
 # 返回任务列表前清理当前选择
+def clear_chat_state():
+    for key in list(st.session_state):
+        if key.startswith(("chat_", "card_", "review_", "conversation_")):
+            st.session_state.pop(key, None)
+
+
+def remember_task_edits():
+    if draft_has_changes():
+        base = st.session_state["draft_base"]
+        edits = st.session_state.setdefault("saved_edits", {})
+        edits[base["task_id"]] = {"base": base, "edits": dict(st.session_state["draft_edits"])}
+
+
 def clear_task_selection():
     clear_draft_state()  # 切换任务不沿用上一项任务的草稿和版本。
     # selected_task 是任务字典，例如 {"task_id": "F001", "task_status": "pending", ...}。
@@ -103,6 +117,8 @@ def clear_task_selection():
     st.session_state["message"] = []
     st.session_state.pop("chat_scope", None)
     st.session_state.pop("scope_risk", None)
+    st.session_state.pop("chat_review_prefill", None)
+    st.session_state.pop("chat_open_card", None)
 
 
 # 将 requests 异常转成中文页面提示
@@ -164,23 +180,24 @@ def get_view(token, path):
 
 def go_home(workspace="home"):
     """返回工作区首页，按任务保留尚未保存的表单内容；只改变页面会话。"""
-    if draft_has_changes():
-        base = st.session_state["draft_base"]  # 保留开始编辑时的版本，恢复后仍能检查冲突。
-        edits = st.session_state.setdefault("saved_edits", {})
-        edits[base["task_id"]] = {"base": base, "edits": dict(st.session_state["draft_edits"])}
+    remember_task_edits()
     clear_task_selection()
     st.session_state.pop("selected_patient", None)
     st.session_state["workspace"] = workspace
     st.rerun()
 
 
-def open_task(token, task_id):
+def open_task(token, task_id, review_card=None):
     """用户点选时通过 GET 重查归属；成功才绑定任务、恢复该任务的未保存修改。"""
     task = get_view(token, f"/tasks/{task_id}")
     if task is None:
         st.stop()
+    remember_task_edits()
     clear_task_selection()
+    st.session_state.pop("selected_patient", None)
     st.session_state["selected_task"] = task
+    if review_card:
+        st.session_state["chat_review_prefill"] = review_card
     cached = st.session_state.get("saved_edits", {}).pop(task_id, None)
     if cached and task["task_status"] in EDITABLE_STATES:
         st.session_state["draft_base"] = cached["base"]
@@ -189,10 +206,13 @@ def open_task(token, task_id):
     st.rerun()
 
 
-def open_patient(patient_id):
+def open_patient(patient_id, open_card=None):
     """从医生名册选择一位患者；详情页会再次请求后端核对权限。"""
+    remember_task_edits()
     clear_task_selection()
     st.session_state["selected_patient"] = patient_id
+    if open_card:
+        st.session_state["chat_open_card"] = open_card
     st.session_state["workspace"] = "patient"
     st.rerun()
 
@@ -216,6 +236,7 @@ def verified_user(token):
     # 后端可能调整账号角色；先比较身份，变化时清理旧任务和旧对话。
     previous_user = st.session_state.get("user", {})
     if previous_user.get("user_id") != user["user_id"] or previous_user.get("role") != user["role"]:
+        clear_chat_state()
         clear_task_selection()
         for key in ("workspace", "selected_patient", "saved_edits", "chat_scope", "scope_risk", "patient_search", "patient_filter",
                     "doctor_section", "confirm_logout", "logout_requested"):

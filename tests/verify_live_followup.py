@@ -137,21 +137,28 @@ def run():
         page.button(key=key).click().run()
         assert not page.exception, page.exception
 
+    def click_label(page, label):
+        button, = [item for item in page.button if item.label == label]
+        button.click().run()
+        assert not page.exception, page.exception
+
     def screen_text(page, kind):
         return " ".join(item.value for item in page.get(kind))
 
-    def chat(page, message):
+    def chat(page, message, scope=""):
         page.chat_input[0].set_value(message).run()
         assert not page.exception, page.exception
         assert not page.error, screen_text(page, "error")
-        assert page.session_state["message"][-1]["role"] == "assistant"
+        messages = api(page, "GET", "/chat/history" + scope)["messages"]
+        assert messages[-2]["role"] == "user" and messages[-2]["content"] == message
+        answer = messages[-1]
+        assert answer["role"] == "assistant" and answer["status"] == "complete"
+        return answer
 
     def doctor_select(page, task):
-        """回到医生名册，点击本例中患者唯一的待办。仅通过页面读后端，选错任务时断言失败。"""
+        """在总对话的待审核提醒中选择任务，进入其专属对话。"""
         click(page, "return_tasks")
-        page.radio(key="doctor_section").set_value("我的患者").run()
-        page.selectbox(key="patient_filter").select("待我处理").run()
-        click(page, "roster_work_" + task)
+        click(page, "enter_task_" + task)
         assert page.session_state["selected_task"]["task_id"] == task
 
     def review(page, task, action, note="", summary=""):
@@ -187,30 +194,28 @@ def run():
             doctor = login_page("陈怡", "医生")
             peer = login_page("何远", "医生")
             empty_patient = login_page("周宁", "患者")
-            # 无任务可问助手，医生从名册进入同一份档案；另一位医生仅见自己负责的任务。
-            assert "没有随访安排" in screen_text(empty_patient, "info")
-            assert [button.key for button in empty_patient.button if "助手" in button.label] == ["open_assistant"]
+            # 无任务也能在总对话直接提问，医生按患者找到专属对话。
+            assert len(empty_patient.chat_input) == 1
+            assert not api(empty_patient, "GET", "/tasks")
             click(empty_patient, "open_settings")
             empty_patient.text_input[0].input("010-21003333")
             empty_patient.text_area[0].input("既往高血压病史三年")
             click(empty_patient, "FormSubmitter:profile_P2-保存个人资料")
-            doctor.selectbox(key="patient_filter").select("暂无任务").run()
-            click(doctor, "patient_P2")
+            doctor.selectbox(key="conversation_patient_picker").set_value("P2").run()
+            click_label(doctor, "进入患者对话")
             assert "周宁" in screen_text(doctor, "title")
-            assert "既往高血压病史三年" in screen_text(doctor, "markdown")
-            assert "010-21003333" in screen_text(doctor, "code")
-            click(doctor, "open_assistant")
-            chat(doctor, "请查询当前患者的基本档案，告诉我她的姓名和主管医生。")
-            assert "周宁" in doctor.session_state["message"][-1]["content"]
-            assert api(doctor, "GET", "/patients/P2")["tasks"] == []
+            detail = api(doctor, "GET", "/patients/P2")
+            assert detail["patient"]["medical_history"] == "既往高血压病史三年"
+            assert detail["patient"]["phone"] == "010-21003333" and detail["tasks"] == []
+            answer = chat(doctor, "请查询当前患者的基本档案，告诉我她的姓名和主管医生。", "?patient_id=P2")
+            assert "周宁" in answer["content"]
             peer_view = api(peer, "GET", "/patients/P1")
             assert [row["task_id"] for row in peer_view["tasks"]] == ["F002"]
             for path in ("/patients/P2", "/tasks/F001/report"):
                 denied = requests.get(base + path, headers={"Authorization": "Bearer " + peer.session_state["token"]}, timeout=5)
                 assert denied.status_code == 404
-            click(empty_patient, "open_assistant")
-            chat(empty_patient, "请检索健康知识库，告诉我家庭血压记录应包含什么，以及资料名称。")
-            answer = empty_patient.session_state["message"][-1]
+            click(empty_patient, "return_tasks")
+            answer = chat(empty_patient, "请检索健康知识库，告诉我家庭血压记录应包含什么，以及资料名称。")
             assert "血压" in answer["content"] and "测量" in answer["content"]
             # 移除旧的纯文本 RAG 方法后，聊天仍须把本轮真实检索的片段交给页面。
             assert answer.get("sources")
@@ -218,20 +223,24 @@ def run():
                 original = (ROOT / "data" / source["source"]).read_text(encoding="utf-8")
                 assert source["excerpt"] and source["excerpt"] in original
             assert "工具rag_search调用成功" in (directory / "service.log").read_text(encoding="utf-8")
+            click_label(empty_patient, "退出登录")
+            empty_patient = login_page("周宁", "患者")
+            assert api(empty_patient, "GET", "/chat/history")["messages"][-1] == answer
+            assert answer["content"] in screen_text(empty_patient, "markdown")
             print("通过：无任务患者和医生档案助手可用，两位医生的患者、任务权限独立", flush=True)
             click(patient, "enter_task_F001")
             assert not patient.text_input and not patient.checkbox
-            chat(patient, "我来做这次随访，请问我需要告诉你什么？")
-            chat(patient, "今天上午八点半测了一下，高压128，低压78。")
+            chat(patient, "我来做这次随访，请问我需要告诉你什么？", "?task_id=F001")
+            chat(patient, "今天上午八点半测了一下，高压128，低压78。", "?task_id=F001")
             first = api(patient, "GET", "/tasks/F001/draft")
             assert first["data"]["systolic_bp"] == 128 and first["data"]["diastolic_bp"] == 78
             assert first["missing_fields"] and not patient.text_input and not patient.checkbox
-            click(patient, "open_assistant")
-            chat(patient, "我刚量的血压是135/85，请查询本次随访由哪位医生负责。")
-            assert "陈怡" in patient.session_state["message"][-1]["content"]
+            click(patient, "return_tasks")
+            answer = chat(patient, "我刚量的血压是135/85，请查询我的主管医生是哪位。")
+            assert "陈怡" in answer["content"]
             assert api(patient, "GET", "/tasks/F001/draft")["revision"] == first["revision"]
-            click(patient, "resume_context")
-            chat(patient, "这几天身上挺好的，药天天按点吃，吃了药也没啥不舒服的。")
+            click(patient, "conversation_task_F001")
+            chat(patient, "这几天身上挺好的，药天天按点吃，吃了药也没啥不舒服的。", "?task_id=F001")
             collected = api(patient, "GET", "/tasks/F001/draft")
             assert not collected["missing_fields"], collected["missing_fields"]
             assert collected["data"]["medication_adherence"] == "regular"
@@ -245,12 +254,9 @@ def run():
             assert again["already_submitted"] and again["record_id"] == submitted["record_id"]
             doctor_select(doctor, "F001")
             # 医生从当次随访问报告时，应由只读工具取得正式草稿与进度。
-            click(doctor, "open_assistant")
-            chat(doctor, "请查询这次的报告状态，并告诉我报告中记录的血压是多少。")
-            report_answer = doctor.session_state["message"][-1]["content"]
-            assert "126" in report_answer and "78" in report_answer
-            assert "工具get_current_report调用成功" in (directory / "service.log").read_text(encoding="utf-8")
-            click(doctor, "resume_context")
+            answer = chat(doctor, "请查询这次的报告状态，并告诉我报告中记录的血压是多少。", "?task_id=F001")
+            assert "126" in answer["content"] and "78" in answer["content"]
+            assert any(card["kind"] == "report" and card["task_id"] == "F001" for card in answer["cards"])
             pending = review(doctor, "F001", "通过")
             assert pending["record"]["systolic_bp"] == 126
             assert pending["content"]["sources"] and pending["content"]["recommendations"]
@@ -265,7 +271,7 @@ def run():
 
             click(patient, "return_tasks")
             click(patient, "enter_task_F002")
-            chat(patient, "我今天还没量血压。最近没有不舒服。出院时没有开药。")
+            chat(patient, "我今天还没量血压。最近没有不舒服。出院时没有开药。", "?task_id=F002")
             # 独立核对路径接受没测血压及没开药。
             if any(button.key == "open_manual_form" for button in patient.button):
                 click(patient, "open_manual_form")
@@ -294,8 +300,7 @@ def run():
             # 从历史入口分别阅读两份已发布报告，核对当时负责的不同医生和职称。
             for task, name, title in (("F001", "陈怡", "主任医师"), ("F002", "何远", "主治医师")):
                 click(patient, "return_tasks")
-                assert patient.button(key="enter_task_" + task).label == "阅读报告"
-                click(patient, "enter_task_" + task)
+                click(patient, "conversation_task_" + task)
                 detail = api(patient, "GET", f"/tasks/{task}/report")
                 assert detail["responsible_doctor"]["name"] == name and detail["reviewer"]["title"] == title
                 assert name in screen_text(patient, "markdown") and title in screen_text(patient, "markdown")
@@ -315,8 +320,10 @@ def run():
             assert "120" in red_flag and "010-21001111" in red_flag
             assert "胸痛" in screen_text(patient, "markdown")  # 规则触发原因在模型失败后仍保留。
             click(doctor, "return_tasks")
-            doctor.radio(key="doctor_section").set_value("风险通知").run()
+            click_label(doctor, "查看风险提醒")
             assert "胸痛" in screen_text(doctor, "warning")
+            click_label(doctor, "标记已处理")
+            assert api(doctor, "GET", "/notifications")[0]["handled_at"]
             click(patient, "open_manual_form")
             patient.selectbox(key="draft_field_bp_measurement_status").select("还没测")
             patient.selectbox(key="draft_field_medication_adherence").select("没有开药")

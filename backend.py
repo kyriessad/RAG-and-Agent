@@ -24,7 +24,7 @@ from pydantic import BaseModel, ConfigDict, Field
 # stream_chat 返回事件生成器；forget_session 清理当前 token 对应的内存记忆。
 from agent.tools.chat_session import forget_session, stream_chat
 # 账号查询和令牌撤销集中在 user_store，页面无需了解密码存储格式。
-from utils import followup_store, schedule_store, user_store
+from utils import chat_store, followup_store, schedule_store, user_store
 from utils import report_store  # 独立处理报告的授权查询、版本检查和事务。
 # 工具查询和 HTTP 查询复用相同的任务权限条件。
 from utils.followup_store import get_followup_task, list_followup_tasks
@@ -38,12 +38,14 @@ from utils.risk_store import handle_doctor_notification, list_doctor_notificatio
 from utils.risk_rules import evaluate_risk
 from utils.logger_handler import logger
 
+
 @asynccontextmanager
 async def lifespan(application):
     """启动时升级排期字段、补扫到期事项，每分钟继续扫描；数据库错误向启动方报告。"""
     user_store.init_db()
     migrate_risk_notifications()
     schedule_store.migrate_schedule()  # 首次启用时标记已有出院记录，后续启动保留原标记。
+    chat_store.migrate_chat()
     schedule_store.scan_schedule()  # 停机期间到期的任务从本次实际开放起算 48 小时。
     scheduler = BackgroundScheduler(timezone=timezone(timedelta(hours=8)))
     # 每个整分钟扫描。同进程最多运行一份，数据库事务和唯一键负责跨进程去重。
@@ -66,7 +68,6 @@ bearer = HTTPBearer(auto_error=False)
 async def report_error(request, error):
     """把业务异常转换为统一的 HTTP 回复，如 409 表示需要刷新；不记录病历正文。"""
     return JSONResponse(status_code=error.status, content={"detail": str(error)})
-
 
 
 class AccountData(BaseModel):
@@ -110,6 +111,7 @@ class ChatData(BaseModel):
     # 字符串先清理首尾空白，全空格的消息会在长度检查时被拒绝。
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
     message: str = Field(min_length=1, max_length=4000)
+    request_id: UUID | None = None
     # 不传 task_id 或传 null 表示普通聊天；传任务编号时，后端还要检查任务归属。
     task_id: str | None = Field(default=None, min_length=1, max_length=64)
     # 档案页选中的患者还须在服务端核实；查询为默认，只有主动采集才提供草稿工具。
@@ -280,7 +282,8 @@ def register_discharge(patient_id: str, data: DischargeRegistration, user: dict 
 
 
 @app.patch("/patients/{patient_id}/discharges/{discharge_id}")
-def supplement_discharge(patient_id: str, discharge_id: str, data: DischargeDetails, user: dict = Depends(current_user)):
+def supplement_discharge(patient_id: str, discharge_id: str, data: DischargeDetails,
+                         user: dict = Depends(current_user)):
     if user["role"] != "doctor":
         raise HTTPException(status_code=403, detail="只有主管医生可以补充出院资料。")
     changes = data.model_dump(exclude_unset=True)
@@ -455,6 +458,36 @@ def review_report(task_id: str, data: report_store.ReviewRequest, user: dict = D
     return report_store.review_report(user, task_id, data)
 
 
+class CardSelection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    message_id: str = Field(pattern=r"^[1-9][0-9]{0,17}-a$")
+    card_index: int = Field(ge=0)
+
+
+@app.post("/chat/cards/select")
+def select_card(data: CardSelection, user: dict = Depends(current_user)):
+    try:
+        return chat_store.select_card(user["user_id"], user["role"], int(data.message_id[:-2]), data.card_index)
+    except chat_store.ChatAccessError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+
+
+@app.get("/chat/conversations")
+def list_conversations(user: dict = Depends(current_user)):
+    try:
+        return {"conversations": chat_store.conversations(user["user_id"], user["role"])}
+    except chat_store.ChatAccessError as error:
+        raise HTTPException(status_code=403, detail=str(error)) from error
+
+
+@app.get("/chat/history")
+def read_chat_history(patient_id: str | None = None, task_id: str | None = None, user: dict = Depends(current_user)):
+    try:
+        return {"messages": chat_store.history(user["user_id"], user["role"], patient_id, task_id)}
+    except chat_store.ChatAccessError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+
+
 @app.post("/chat")
 def chat(data: ChatData, user: dict = Depends(current_user)):
     """输入消息和可选任务编号，返回聊天事件流；任务无权访问时先返回 404。
@@ -486,8 +519,8 @@ def chat(data: ChatData, user: dict = Depends(current_user)):
         """把事件转为逐行 JSON；草稿校验保存由会话层调用 utils 完成。"""
         # 一行一个 JSON 事件，前端收到一行便可更新工具状态或回答。
         for event in stream_chat(
-            user["session_key"], user["user_id"], user["role"], data.message,
-            task_id=data.task_id, patient_id=patient_id, mode=data.mode,
+                user["session_key"], user["user_id"], user["role"], data.message,
+                task_id=data.task_id, patient_id=patient_id, mode=data.mode, request_id=data.request_id,
         ):
             # 例如 {"type": "status", "content": "正在查询"} 后面加一个换行。
             yield json.dumps(event, ensure_ascii=False) + "\n"

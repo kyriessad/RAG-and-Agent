@@ -6,6 +6,7 @@ import logging
 from uuid import uuid4
 
 from utils.user_store import get_connection
+from utils.chat_store import save_receipt
 
 
 BEIJING = timezone(timedelta(hours=8))  # 业务约定以北京时间的日历日期排期。
@@ -132,8 +133,11 @@ def register_discharge(user_id, patient_id, request_id, discharge_date, diagnosi
         ).fetchall()
         if len(tasks) != len(FOLLOWUP_DAYS):
             raise ValueError("出院日期超出可排期范围，请核对日期。")  # 避免留下已登记却无法排期的记录。
-        return {"discharge_id": discharge_id, "scheduled_at": tasks[0]["scheduled_at"],
-                "schedule": [dict(task) for task in tasks]}
+        receipt = {"discharge_id": discharge_id, "scheduled_at": tasks[0]["scheduled_at"],
+                   "schedule": [dict(task) for task in tasks]}
+        save_receipt(conn, user_id, "doctor", "register_discharge", discharge_id, "出院已登记，三次随访计划已生成。",
+                     patient_id=patient_id, **receipt)
+        return receipt
 
 
 def supplement_discharge(user_id, patient_id, discharge_id, changes):
@@ -160,6 +164,9 @@ def supplement_discharge(user_id, patient_id, discharge_id, changes):
             (changes.get("discharge_instructions", row["discharge_instructions"]),
              changes.get("discharge_medications", row["discharge_medications"]), discharge_id),
         )
+        key = discharge_id + ":" + ",".join(sorted(changes))
+        save_receipt(conn, user_id, "doctor", "supplement_discharge", key, "出院资料已补充。",
+                     patient_id=patient_id, discharge_id=discharge_id, fields=sorted(changes))
         return True
 
 

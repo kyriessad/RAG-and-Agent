@@ -1,0 +1,30 @@
+[data-testid="stAppViewContainer"], [data-testid="stApp"] {
+    --paper: var(--st-background-color, Canvas);
+    --line: color-mix(in srgb, var(--st-text-color, CanvasText) 15%, var(--paper));
+    background-color: color-mix(in srgb, var(--paper) 95%, #718e85);
+}
+.stMainBlockContainer {max-width: 72rem; padding: 3.5rem 2.25rem 4rem;}
+[data-testid="stHeader"] {background: transparent;}
+[data-testid="stAppDeployButton"] {display:none;}
+[data-testid="stSidebar"] {border-inline-end: 1px solid var(--line);}
+[data-testid="stSidebar"] h1 {font-size: 1.45rem;}
+[data-testid="stMain"] h1 {font-size: clamp(1.85rem, 3vw, 2.65rem);letter-spacing: -.035em;}
+[data-testid="stMain"] h2 {font-size: clamp(1.23rem, 2vw, 1.55rem);}
+[class*="st-key-followup_item_"], [class*="st-key-roster_row_"],
+[class*="st-key-primary_task_"], .st-key-report_review_actions, .st-key-login_panel, .st-key-saved_draft_summary {
+    background: var(--paper);border: 1px solid var(--line);border-radius: 14px;
+}
+[class*="st-key-primary_task_"], .st-key-login_panel {
+    border-top: 3px solid #368678;
+    box-shadow: 0 5px 20px rgb(22 58 51 / 6%);
+}
+.st-key-login_panel {padding: clamp(1.1rem, 3vw, 2rem);}
+.st-key-login_panel h1 {font-size: clamp(1.65rem, 3vw, 2rem);}
+.st-key-saved_draft_summary pre {font-family: inherit; white-space: pre-wrap; line-height: 1.75;}
+[data-testid="stBaseButton-primary"], [data-testid="stBaseButton-primaryFormSubmit"] {
+    background-color: #16695e; border-color: #16695e; color: white;
+}
+[data-testid="stBaseButton-primary"]:hover, [data-testid="stBaseButton-primaryFormSubmit"]:hover {
+    background-color: #12584f; border-color: #12584f; color: white;
+}
+@media (max-width: 700px) { .stMainBlockContainer {padding: 3.4rem 1rem 3rem;} }

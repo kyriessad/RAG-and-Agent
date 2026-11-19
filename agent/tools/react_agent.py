@@ -12,7 +12,8 @@ from utils.prompt_loader import load_system_prompts
 from agent.tools.agent_tools import (
     rag_search, get_my_followup_tasks, get_my_discharges,
     get_my_recent_records, propose_followup_draft,
-    get_related_people, get_current_report,
+    get_related_people, get_current_report, get_followup_reminders, get_risk_notifications,
+    read_followup_reports, prepare_report_review, prepare_discharge,
 )
 # 中间件分别观测工具调用、记录模型执行和补充当前任务提示。
 from agent.tools.middle_ware import monitor_tool, log_before_model, followup_prompt
@@ -42,16 +43,22 @@ class ReactAgent:
         self.patient_turns = deque(maxlen=8)
         self.previous_question = ""
         self.expected_revision = None
+        self.previous_cards = []
+        self.history_messages = []
+        self.unassigned_discharge = None
+        self.recent_receipts = []
 
         # 身份由后端查登录凭证得到，模型只能选择查询工具，不能指定其他用户。
         medical_tools = [
             rag_search, get_my_followup_tasks, get_my_discharges,
-            get_my_recent_records, get_related_people,
+            get_my_recent_records, get_related_people, get_followup_reminders, read_followup_reports,
         ]
         if task_id is not None:
             medical_tools.append(get_current_report)  # 复用该角色在报告页能看到的内容。
         if role == "patient" and task_id is not None and mode == "collect":
             medical_tools.append(propose_followup_draft)  # 只在患者任务中开放采集提议。
+        if role == "doctor":
+            medical_tools.extend([get_risk_notifications, prepare_discharge, prepare_report_review])
 
         # 创建一次，后续同一登录和同一任务复用它的内存检查点。
         self.agent = create_agent(
@@ -71,6 +78,28 @@ class ReactAgent:
             checkpointer=InMemorySaver(),  # InMemorySaver：把 Agent 的检查点保存在当前 Python 进程的内存中。
         )
 
+    def restore_history(self, messages, draft_revision=None):
+        """用后端重验归属后的相同会话轮次恢复一次新 Agent。"""
+        self.history_messages = []
+        self.previous_cards = []
+        self.recent_receipts = [msg["content"] for msg in messages if msg.get("receipt")][-3:]
+        question = None
+        self.patient_turns.clear()
+        self.previous_question = ""
+        self.expected_revision = draft_revision
+        for msg in messages:
+            if msg["role"] == "user":
+                question = msg["content"]
+                if draft_revision is not None:
+                    self.patient_turns.append((self.previous_question, question))
+            elif msg["role"] == "assistant":
+                if question is not None:
+                    self.history_messages.extend([{"role": "user", "content": question},
+                                                  {"role": "assistant", "content": msg["content"]}])
+                    question = None
+                self.previous_question = msg["content"]
+                self.previous_cards = msg.get("cards") or []
+
     def execute_stream(self, query: str, draft=None):
         """输入一条问题文本，逐个输出页面约定的聊天事件。
 
@@ -81,24 +110,6 @@ class ReactAgent:
         本方法会调用模型和工具、更新内存；正常完成后把草稿提议交给会话层保存。
         推理或工具异常交给 chat_session 处理，未完成的回答不能作为正常结果保存。
         """
-        # 这一轮只传最新问题，框架按 thread_id 取回历史，无需前端重发。
-        input_dict = {
-            "messages": [
-                {"role": "user", "content": query}
-            ]
-        }
-
-        # 将工具内部名称翻译成页面状态文案，例如 rag_search 显示“检索高血压知识库”。
-        tool_names = {
-            "get_my_followup_tasks": "查询随访任务",
-            "get_my_discharges": "查询出院信息",
-            "get_my_recent_records": "查询近期血压记录",
-            "get_related_people": "查询医患资料",
-            "get_current_report": "读取本次随访进度和报告",
-            "rag_search": "检索高血压知识库",
-            "propose_followup_draft": "整理本次随访信息",
-        }
-
         # set 保存已展示过的调用编号，防止多次读取同一状态时重复刷屏。
         shown_tool_calls = set()
         # 直到拿到完整助手消息才在这里保留文本，delta 只负责即时显示。
@@ -108,16 +119,24 @@ class ReactAgent:
         context = {"user_id": self.user_id, "role": self.role,
                    "task_id": self.task_id, "patient_id": self.patient_id,
                    "draft": draft, "patient_message": query,
+                   "cards": {}, "previous_cards": self.previous_cards,
+                   "unassigned_discharge": self.unassigned_discharge,
+                   "recent_receipts": self.recent_receipts,
                    "draft_lock": Lock()}
         if draft is not None:
             if draft["revision"] != self.expected_revision:
                 # 页面手工更改过草稿时，旧聊天不能重新填回患者清空的字段。
                 if self.expected_revision is not None:
                     self.agent.checkpointer.delete_thread(self.thread_id)
+                    self.history_messages.clear()
                 self.patient_turns.clear()
                 self.previous_question = ""
             context["patient_turns"] = tuple(self.patient_turns)
             context["previous_question"] = self.previous_question
+
+        # 恢复登录时只补一次历史，之后线程检查点已包含这些消息。
+        input_dict = {"messages": [*self.history_messages, {"role": "user", "content": query}]}
+        self.history_messages = []
 
         # yield 先发一条状态，然后继续运行，前端无需等整个函数返回。
         yield {
@@ -181,13 +200,6 @@ class ReactAgent:
                                 "type": "reset",
                                 "content": "",  # # 清空前端已显示的字
                             }
-                            # 例如 name 为 get_my_recent_records，页面应显示中文进度。
-                            name = tool_call["name"]
-                            label = tool_names.get(name, name)  # eg:正在 "查询使用记录"
-                            yield {
-                                "type": "status",
-                                "content": f"正在{label}……",
-                            }
                     elif message.text:
                         # 保留完整答案，供最后确认和保存。
                         final_answer = message.text
@@ -206,11 +218,11 @@ class ReactAgent:
                         for entry in result.artifact:
                             if entry not in sources:
                                 sources.append(entry)  # 多次检索命中同一原文时，页面只列一次。
-                    yield {
-                        "type": "status",
-                        "content": "工具已返回结果，正在继续处理……",
-                    }
-
+        if final_answer:
+            self.previous_cards = list(context["cards"].values())
+            self.unassigned_discharge = context.get("awaiting_patient")
+            if self.previous_cards:
+                yield {"type": "cards", "content": self.previous_cards}
         if final_answer and draft is not None:
             self.patient_turns.append((self.previous_question, query))
             self.previous_question = final_answer
