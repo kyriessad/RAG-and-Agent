@@ -8,11 +8,6 @@ from utils.config_handler import agent_conf
 
 # 接受前端的请求，发给后端执行，再把后端结果返回给前端
 def request_api(method, path, token=None, data=None, stream=False):
-    """向 FastAPI 发送一次 HTTP 请求，成功返回 Response，超时或非成功状态抛 requests 异常。
-
-    例如 GET /tasks/F001/report 取 .json() 可得到任务状态；POST /chat 则用 iter_lines()。
-    token 只进入请求头。这里不自动重试任何写操作，是否重试由相应业务界面决定。
-    """
     # eg: path='/auth/login'，url为 http://127.0.0.1:8000/auth/login。
     # method 是请求方法，例如 GET 读取、PUT 保存完整草稿、POST 确认或审核。
     # rstrip 去掉地址末尾斜杠，再接 /tasks/F001/report 等路径。

@@ -31,7 +31,7 @@ EDITABLE_STATES = ("pending", "in_progress", "needs_info")
 
 # 清除草稿页面状态，返回 None；只清内存，不删除后端已保存草稿。
 def clear_draft_state():
-    # list() 先复制键名，避免一边遍历字典一边删除导致错误。
+    # list() 先复制键名，避免一边遍历字典一边删除导致错误。 { "draft_": "xxx",... }
     for key in list(st.session_state):
         if key.startswith("draft_"):
             st.session_state.pop(key, None)  # 退出或切换任务时连输入框一起清理。

@@ -49,14 +49,14 @@ def show_registration_form():
         if identity == "患者":
             age_col, gender_col = st.columns(2)
             age = age_col.number_input("年龄", min_value=0, value=None, step=1)
-            genders = {"男": "male", "女": "female", "未说明": "unknown"}
+            genders = {"男": "male", "女": "female",}
             gender = gender_col.selectbox("性别", list(genders), index=None, placeholder="请选择")
             doctor_id = st.selectbox("主管医生", list(doctor_labels), format_func=doctor_labels.get,
                                      index=None, placeholder="选择医生和科室")
         else:
             department = st.text_input("科室", max_chars=64)
-            title = st.text_input("职称（选填）", max_chars=64)
-        phone = st.text_input("联系电话（选填）", max_chars=32)
+            title = st.text_input("职称", max_chars=64)
+        phone = st.text_input("联系电话", max_chars=32)
         submitted = st.form_submit_button("注册并进入工作台", type="primary", width="stretch")
 
     if not submitted:
@@ -85,7 +85,7 @@ def show_registration_form():
     except requests.RequestException as error:
         show_request_error(error)
         return
-    st.success("注册成功。也可以返回登录，使用刚设置的密码进入工作台。")
+    st.success("注册成功。")
     sign_in(name, password, role)
 
 

@@ -89,7 +89,7 @@ class RegistrationPatientProfile(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
     # 与现库年龄字段一致。SQLite 的 INTEGER 能保存的最大值是有符号 64 位整数上限。
     age: int = Field(strict=True, ge=0, le=9223372036854775807)
-    gender: Literal["female", "male", "unknown"]
+    gender: Literal["female", "male",]
     doctor_id: str = Field(min_length=1, max_length=64)  # 主管医生由患者在简要名录中选择。
     phone: str | None = Field(default=None, max_length=32)
 
